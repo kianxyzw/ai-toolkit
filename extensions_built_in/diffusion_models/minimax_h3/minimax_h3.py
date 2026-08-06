@@ -74,7 +74,11 @@ from .src.packing import (
     unpatchify_video_tokens,
 )
 from .src.pipeline import MiniMaxH3Pipeline
-from .src.text_encoder import TEXT_ENCODER_LAYER, encode_minimax_h3_prompt
+from .src.text_encoder import (
+    TEXT_ENCODER_LAYER,
+    encode_minimax_h3_prompt,
+    sample_ref_video_2fps,
+)
 from .src.transformer import MiniMaxH3Transformer, MiniMaxH3TransformerParams
 from .src.vae import MiniMaxH3VideoVAE
 
@@ -275,6 +279,10 @@ class MinimaxH3Model(BaseModel):
                 f"model_kwargs.partition must be fl2va or ref2va, got {partition}"
             )
         return f"dit_{partition}"
+
+    @property
+    def is_ref2va(self) -> bool:
+        return self._dit_component() == "dit_ref2va"
 
     def load_training_adapter(self, transformer: MiniMaxH3Transformer):
         """Load an assistant LoRA (e.g. a de-distillation adapter) as a LIVE
@@ -641,7 +649,49 @@ class MinimaxH3Model(BaseModel):
 
         # control tensors arrive in [0, 1]; the Qwen3-VL processor wants PIL
         keyframes_per_prompt = [None] * len(prompt)
-        if control_images is not None:
+        ref_items_per_prompt = [None] * len(prompt)
+        if control_images is not None and self.is_ref2va:
+            # ref2va: the control channel carries the reference media — video
+            # tensors (T, C, H, W) become <Video k> 2 fps presentations,
+            # single images become <Picture i> vision blocks
+            if isinstance(control_images, list) and control_images and isinstance(
+                control_images[0], list
+            ):
+                per_prompt = control_images
+            elif isinstance(control_images, torch.Tensor) and control_images.ndim == 5:
+                per_prompt = [
+                    [control_images[i]] for i in range(control_images.shape[0])
+                ]
+            elif isinstance(control_images, list):
+                per_prompt = [control_images] * len(prompt)
+            else:
+                per_prompt = [[control_images]] * len(prompt)
+            if len(per_prompt) == 1 and len(prompt) > 1:
+                per_prompt = per_prompt * len(prompt)
+            items_per_prompt = []
+            for controls in per_prompt:
+                items = []
+                for c in controls:
+                    if isinstance(c, torch.Tensor) and c.ndim == 4 and c.shape[0] > 1:
+                        frames, timestamps = sample_ref_video_2fps(
+                            c.float().clamp(0, 1).cpu()
+                        )
+                        items.append(
+                            {"type": "video", "data": frames, "timestamps": timestamps}
+                        )
+                    else:
+                        img = c
+                        if isinstance(img, torch.Tensor):
+                            if img.ndim == 4:
+                                img = img[0]
+                            arr = (
+                                (img.float().clamp(0, 1) * 255).round().to(torch.uint8)
+                            )
+                            img = Image.fromarray(arr.permute(1, 2, 0).cpu().numpy())
+                        items.append({"type": "image", "data": img})
+                items_per_prompt.append(items)
+            ref_items_per_prompt = items_per_prompt
+        elif control_images is not None:
             if isinstance(control_images, torch.Tensor):
                 images = [control_images[i] for i in range(control_images.shape[0])]
             elif isinstance(control_images, list):
@@ -670,13 +720,16 @@ class MinimaxH3Model(BaseModel):
                 keyframes_per_prompt = [pil_images] * len(prompt)
 
         embeds_list, tags_list = [], []
-        for p, keyframes in zip(prompt, keyframes_per_prompt):
+        for p, keyframes, ref_items in zip(
+            prompt, keyframes_per_prompt, ref_items_per_prompt
+        ):
             embeds, tags = encode_minimax_h3_prompt(
                 self.text_encoder,
                 self.tokenizer,
                 self.processor,
                 p.strip(),
                 keyframes=keyframes,
+                ref_items=ref_items,
                 device=self.device_torch,
                 dtype=self.torch_dtype,
                 max_length=self.max_text_length,
@@ -850,12 +903,91 @@ class MinimaxH3Model(BaseModel):
             t_v = 1.0 - sigma_v
             t_a = 1.0 - sigma_a
 
+            # --- ref2va reference conditioning rows ------------------------
+            # references arrive as cached latents (reference_latents: one
+            # (B, 24, t, h, w) per reference) or raw pixel videos
+            # (reference_tensors: one (B, T, C, H, W) in [-1, 1] per
+            # reference); reference_kinds ("video" / "image") disambiguates
+            # single-frame refs, defaulting on temporal extent
+            ref_latents_src = (
+                getattr(batch, "reference_latents", None) if batch is not None else None
+            )
+            ref_pixels_src = (
+                getattr(batch, "reference_tensors", None) if batch is not None else None
+            )
+            ref_kinds = (
+                getattr(batch, "reference_kinds", None) if batch is not None else None
+            ) or []
+            ref_blocks = []
+            ref_rows_list = []
+            if ref_latents_src or ref_pixels_src:
+                if not self.is_ref2va:
+                    raise ValueError(
+                        "reference conditioning needs model_kwargs.partition: "
+                        "ref2va — the fl2va weights were not trained on "
+                        "reference blocks"
+                    )
+                if ref_latents_src:
+                    ref_latents = [
+                        r.to(device, torch.float32) for r in ref_latents_src
+                    ]
+                else:
+                    ref_latents = [
+                        self.encode_images(
+                            [item for item in r], device=device, dtype=torch.float32
+                        )
+                        for r in ref_pixels_src
+                    ]
+                for ri, ref in enumerate(ref_latents):
+                    if ref.ndim == 4:
+                        ref = ref.unsqueeze(2)
+                    rt_, rh_, rw_ = (
+                        int(ref.shape[2]),
+                        int(ref.shape[3]),
+                        int(ref.shape[4]),
+                    )
+                    kind = (
+                        ref_kinds[ri]
+                        if ri < len(ref_kinds)
+                        else ("image" if rt_ == 1 else "video")
+                    )
+                    if kind == "image":
+                        if rt_ != 1:
+                            raise ValueError(
+                                f"image reference {ri} has {rt_} latent frames"
+                            )
+                        ref_blocks.append(
+                            {"kind": "image", "latent_h": rh_, "latent_w": rw_}
+                        )
+                    else:
+                        ref_blocks.append(
+                            {
+                                "kind": "video",
+                                "latent_t": rt_,
+                                "latent_h": rh_,
+                                "latent_w": rw_,
+                                "ref_audio_t": 0,
+                            }
+                        )
+                    # references ride at t = 0.999: lightly noised, pinned,
+                    # never denoised (fresh noise per draw, like keyframes)
+                    ref = (
+                        KEYFRAME_NOISE_AUG_T * ref
+                        + (1.0 - KEYFRAME_NOISE_AUG_T) * torch.randn_like(ref)
+                    )
+                    ref_rows_list.append(patchify_video_latents(ref).to(dtype))
+
             # --- i2v first-frame conditioning rows -------------------------
             do_i2v = (
                 batch is not None
                 and batch.dataset_config.do_i2v
                 and getattr(batch, "num_frames", 1) > 1
             )
+            if do_i2v and ref_blocks:
+                raise ValueError(
+                    "do_i2v keyframes and reference conditioning cannot be "
+                    "combined (fl2va vs ref2va partitions)"
+                )
             cond_rows = None
             if do_i2v:
                 if batch.first_frame_latents is not None:
@@ -964,6 +1096,7 @@ class MinimaxH3Model(BaseModel):
                         latent_width=w_lat,
                         num_audio_latents=a_lat,
                         keyframe_anchors=anchors,
+                        reference_blocks=tuple(ref_blocks),
                     )
                 )
             (
@@ -1001,6 +1134,10 @@ class MinimaxH3Model(BaseModel):
             ).to(dtype)
             if cond_rows is not None:
                 video_rows = torch.cat([cond_rows, video_rows], dim=1)
+            if ref_rows_list:
+                # condition-first row order, matching the layout's
+                # video_indices (reference rows precede target rows)
+                video_rows = torch.cat(ref_rows_list + [video_rows], dim=1)
 
         video_pred, audio_pred = self.model(
             hidden_states=video_rows,
