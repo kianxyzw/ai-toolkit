@@ -816,6 +816,13 @@ class ImageProcessingDTOMixin:
         # handle get_prompt_embedding
         if self.is_text_embedding_cached:
             self.load_prompt_embedding()
+        # reference media: needed as pixels unless BOTH consumers are cached
+        # (latents feed the DiT conditioning rows, the 2 fps subsample feeds
+        # the text embeddings)
+        if getattr(self, 'has_references', False) and (
+            not self.is_latent_cached or not self.is_text_embedding_cached
+        ):
+            self.load_references()
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
@@ -1152,6 +1159,102 @@ class ControlFileItemDTOMixin:
     def cleanup_control(self: 'FileItemDTO'):
         self.control_tensor = None
         self.control_tensor_list = None
+
+
+# reference media (see DatasetConfig.reference_path) may be videos or images
+ref_video_ext_list = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
+
+
+class ReferenceFileItemDTOMixin:
+    """Reference conditioning media (e.g. MiniMax H3 ref2va): per training
+    file, one name-matched video or image from each ``reference_path`` folder.
+
+    Unlike control images, references keep their NATIVE canvas (cropped down
+    to the nearest /32 multiple when needed — never resized) and their full
+    frame range: the packed-attention models these feed treat each reference
+    as its own spatial grid, and reference/target frame counts are
+    independent. Missing matches raise — references are paired supervision,
+    a silent skip would train the wrong task.
+    """
+
+    def __init__(self: 'FileItemDTO', *args, **kwargs):
+        if hasattr(super(), '__init__'):
+            super().__init__(*args, **kwargs)
+        self.has_references = False
+        self.reference_paths: Union[List[str], None] = None
+        self.reference_kinds: Union[List[str], None] = None
+        self.reference_tensors: Union[List[torch.Tensor], None] = None
+        dataset_config = kwargs.get('dataset_config', None)
+        ref_dirs = getattr(dataset_config, 'reference_path', None) if dataset_config is not None else None
+        if ref_dirs:
+            if not isinstance(ref_dirs, list):
+                ref_dirs = [ref_dirs]
+            file_name_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+            found, kinds = [], []
+            for ref_dir in ref_dirs:
+                match = None
+                for ext in ref_video_ext_list + img_ext_list:
+                    candidate = os.path.join(ref_dir, file_name_no_ext + ext)
+                    if os.path.exists(candidate):
+                        match = candidate
+                        kinds.append('video' if ext in ref_video_ext_list else 'image')
+                        break
+                if match is None:
+                    raise FileNotFoundError(
+                        f"reference_path: no media named {file_name_no_ext}.* in "
+                        f"{ref_dir} for {self.path}"
+                    )
+                found.append(match)
+            self.reference_paths = found
+            self.reference_kinds = kinds
+            self.has_references = True
+
+    @staticmethod
+    def _crop_to_multiple(t: torch.Tensor, multiple: int = 32) -> torch.Tensor:
+        # (T, C, H, W) center-crop down to the nearest /multiple canvas
+        h, w = int(t.shape[2]), int(t.shape[3])
+        th, tw = (h // multiple) * multiple, (w // multiple) * multiple
+        if th == h and tw == w:
+            return t
+        if th == 0 or tw == 0:
+            raise ValueError(f"reference media too small: {h}x{w}")
+        top, left = (h - th) // 2, (w - tw) // 2
+        return t[:, :, top:top + th, left:left + tw]
+
+    def load_references(self: 'FileItemDTO'):
+        """Decode references -> list of (T, C, H, W) float tensors in [0, 1]
+        (T = 1 for images)."""
+        if not self.has_references or self.reference_tensors is not None:
+            return
+        tensors = []
+        for path, kind in zip(self.reference_paths, self.reference_kinds):
+            if kind == 'video':
+                cap = cv2.VideoCapture(path)
+                if not cap.isOpened():
+                    raise Exception(f"Error: Could not open reference video {path}")
+                frames = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frames.append(
+                        torch.from_numpy(
+                            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        ).permute(2, 0, 1)
+                    )
+                cap.release()
+                if len(frames) == 0:
+                    raise Exception(f"Error: reference video has no frames: {path}")
+                t = torch.stack(frames).float() / 255.0
+            else:
+                img = Image.open(path)
+                img = exif_transpose(img).convert('RGB')
+                t = transforms.ToTensor()(img).unsqueeze(0)
+            tensors.append(self._crop_to_multiple(t))
+        self.reference_tensors = tensors
+
+    def cleanup_references(self: 'FileItemDTO'):
+        self.reference_tensors = None
 
 
 class ClipImageFileItemDTOMixin:
@@ -1697,6 +1800,7 @@ class LatentCachingFileItemDTOMixin:
         self._encoded_latent: Union[torch.Tensor, None] = None
         self._cached_first_frame_latent: Union[torch.Tensor, None] = None
         self._cached_audio_latent: Union[torch.Tensor, None] = None
+        self._cached_reference_latents: Union[List[torch.Tensor], None] = None
         self._cached_tensor_uint8: Union[torch.Tensor, None] = None
         self._cached_waveform_int16: Union[torch.Tensor, None] = None
         self._cached_waveform_sample_rate: Union[int, None] = None
@@ -1750,6 +1854,9 @@ class LatentCachingFileItemDTOMixin:
         if self.dataset_config.cache_tensors_to_disk:
             # tensor is stored in the cache file, invalidate caches made without it
             item["cache_tensors_to_disk"] = True
+        if getattr(self, 'has_references', False):
+            # reference latents are stored in the cache file
+            item["reference_paths"] = [os.path.basename(p) for p in self.reference_paths]
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -1776,6 +1883,7 @@ class LatentCachingFileItemDTOMixin:
                 self._encoded_latent = None
                 self._cached_first_frame_latent = None
                 self._cached_audio_latent = None
+                self._cached_reference_latents = None
                 self._cached_tensor_uint8 = None
                 self._cached_waveform_int16 = None
                 self._cached_waveform_sample_rate = None
@@ -1786,6 +1894,10 @@ class LatentCachingFileItemDTOMixin:
                     self._cached_first_frame_latent = self._cached_first_frame_latent.to('cpu')
                 if self._cached_audio_latent is not None:
                     self._cached_audio_latent = self._cached_audio_latent.to('cpu')
+                if self._cached_reference_latents is not None:
+                    self._cached_reference_latents = [
+                        r.to('cpu') for r in self._cached_reference_latents
+                    ]
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
@@ -1807,6 +1919,12 @@ class LatentCachingFileItemDTOMixin:
                     self._cached_first_frame_latent = _latent_from_uint8(self._cached_first_frame_latent)
             if 'audio_latent' in state_dict:
                 self._cached_audio_latent = state_dict['audio_latent']
+            ref_keys = sorted(
+                (k for k in state_dict if k.startswith('reference_latent_')),
+                key=lambda k: int(k.rsplit('_', 1)[-1]),
+            )
+            if ref_keys:
+                self._cached_reference_latents = [state_dict[k] for k in ref_keys]
             if 'num_frames' in state_dict:
                 self.num_frames = int(state_dict['num_frames'].item())
             if 'tensor' in state_dict:
@@ -1929,6 +2047,14 @@ class LatentCachingMixin:
                     file_item._cached_first_frame_latent = cached_first_frame.to('cpu', dtype=self.sd.torch_dtype)
                 if 'audio_latent' in state_dict:
                     file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
+                ref_keys = sorted(
+                    (k for k in state_dict if k.startswith('reference_latent_')),
+                    key=lambda k: int(k.rsplit('_', 1)[-1]),
+                )
+                if ref_keys:
+                    file_item._cached_reference_latents = [
+                        state_dict[k].to('cpu', dtype=self.sd.torch_dtype) for k in ref_keys
+                    ]
                 if 'tensor' in state_dict:
                     file_item._cached_tensor_uint8 = state_dict['tensor']
                 if 'waveform' in state_dict:
@@ -1997,6 +2123,22 @@ class LatentCachingMixin:
                 if to_disk:
                     state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
 
+            # reference conditioning media, each on its own canvas
+            reference_latents = None
+            if getattr(file_item, 'has_references', False):
+                file_item.load_references()
+                reference_latents = []
+                for ref in file_item.reference_tensors:
+                    # references load in [0, 1]; the VAE wants [-1, 1]
+                    ref_in = (ref * 2.0 - 1.0).to(device, dtype=dtype)
+                    item_in = ref_in[0] if ref_in.shape[0] == 1 else ref_in
+                    ref_latent = self.sd.encode_images([item_in]).squeeze(0)
+                    reference_latents.append(ref_latent)
+                if to_disk:
+                    for ri, ref_latent in enumerate(reference_latents):
+                        state_dict[f'reference_latent_{ri}'] = ref_latent.clone().detach().cpu()
+                file_item.cleanup_references()
+
             if is_video:
                 state_dict['num_frames'] = torch.tensor(file_item.num_frames, dtype=torch.int32)
 
@@ -2014,6 +2156,10 @@ class LatentCachingMixin:
                     file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
                 if audio_latent is not None:
                     file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
+                if reference_latents is not None:
+                    file_item._cached_reference_latents = [
+                        r.to('cpu', dtype=self.sd.torch_dtype) for r in reference_latents
+                    ]
 
             del imgs
             del latent
@@ -2056,6 +2202,9 @@ class TextEmbeddingFileItemDTOMixin:
             and (self.dataset_config.auto_frame_count or self.dataset_config.num_frames > 1)
         ):
             item["first_frame_in_te"] = True
+        # reference vision conditioning enters the embeddings -> part of the key
+        if getattr(self, 'has_references', False):
+            item["reference_paths"] = [os.path.basename(p) for p in self.reference_paths]
         return item
 
     def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
@@ -2114,7 +2263,22 @@ class TextEmbeddingCachingMixin:
                         self.sd.set_device_state_preset('cache_text_encoder')
                         did_move = True
                         
-                    if file_item.encode_control_in_text_embeddings and file_item.control_path is not None:
+                    if getattr(file_item, 'has_references', False):
+                        # reference media (videos/images) ride into the text
+                        # embeddings; the model builds the <Video k>/<Picture i>
+                        # presentation from the raw [0, 1] tensors
+                        file_item.load_references()
+                        ref_list = [
+                            [
+                                r.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                                for r in file_item.reference_tensors
+                            ]
+                        ]
+                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
+                            file_item.caption, control_images=ref_list
+                        )
+                        file_item.cleanup_references()
+                    elif file_item.encode_control_in_text_embeddings and file_item.control_path is not None:
                         ctrl_img_list = []
                         control_path_list = file_item.control_path
                         if not isinstance(file_item.control_path, list):

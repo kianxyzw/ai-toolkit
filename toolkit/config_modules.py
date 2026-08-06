@@ -1081,6 +1081,15 @@ class DatasetConfig:
         self.audio_preserve_pitch: bool = kwargs.get('audio_preserve_pitch', False) # preserve pitch when stretching audio to fit num_frames
         self.audio_normalize: bool = kwargs.get('audio_normalize', False) # normalize audio volume levels when loading
 
+        # reference conditioning (e.g. MiniMax H3 ref2va): folders of reference
+        # media (videos or images) name-matched to the training files. Every
+        # training file must have a match in EVERY folder; order = the
+        # <Video k>/<Picture i> presentation order. References keep their own
+        # canvas and full frame range (no bucketing, no frame sampling).
+        self.reference_path: Union[str, List[str], None] = kwargs.get('reference_path', None)
+        if self.reference_path == '':
+            self.reference_path = None
+
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
     """
