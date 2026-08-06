@@ -388,11 +388,45 @@ class MinimaxH3Model(BaseModel):
         self.assistant_lora.is_active = True
         self.invert_assistant_lora = False
 
+    @staticmethod
+    def _load_sharded_state_dict(index_path: str) -> dict:
+        """Merge a sharded safetensors checkpoint (model.safetensors.index.json
+        + model-XXXXX-of-XXXXX shards) into one state dict on CPU. Needs system
+        RAM for the full checkpoint (~67GB for the original BF16 weights)."""
+        import json
+
+        with open(index_path, "r") as f:
+            index = json.load(f)
+        shard_files = sorted(set(index["weight_map"].values()))
+        base_dir = os.path.dirname(index_path)
+        state_dict = {}
+        for shard in shard_files:
+            state_dict.update(load_file(os.path.join(base_dir, shard)))
+        return state_dict
+
     def _load_transformer(self) -> MiniMaxH3Transformer:
         dtype = self.torch_dtype
         dit_path = self._resolve_comfy_file(self._dit_component())
         self.print_and_status_update(f"Loading transformer from {dit_path}")
-        state_dict = load_file(dit_path)
+        # model_kwargs.dit_path may point at the original (non-Comfy) weights:
+        # a transformer folder or index json of sharded safetensors — e.g.
+        # MiniMaxAI/MiniMax-H3's Ref2VA/transformer BF16 shards
+        if os.path.isdir(dit_path):
+            index_path = os.path.join(dit_path, "model.safetensors.index.json")
+            single_path = os.path.join(dit_path, "model.safetensors")
+            if os.path.exists(index_path):
+                state_dict = self._load_sharded_state_dict(index_path)
+            elif os.path.exists(single_path):
+                state_dict = load_file(single_path)
+            else:
+                raise FileNotFoundError(
+                    f"{dit_path} has neither model.safetensors.index.json nor "
+                    "model.safetensors"
+                )
+        elif dit_path.endswith(".index.json"):
+            state_dict = self._load_sharded_state_dict(dit_path)
+        else:
+            state_dict = load_file(dit_path)
 
         params = MiniMaxH3TransformerParams()
         table = state_dict.get("adaln_t_table", None)
