@@ -137,6 +137,8 @@ class AdvancedPromptEmbeds:
     def save(self, path):
         data = {}
         metadata = {"class_name": self.__class__.__name__}
+        if self._frozen_dtype_keys:
+            metadata["frozen_dtype_keys"] = ",".join(self._frozen_dtype_keys)
         for key, value in self._store.items():
             if len(value) != 1:
                 raise ValueError(
@@ -148,16 +150,25 @@ class AdvancedPromptEmbeds:
 
     @classmethod
     def load(cls, path=None):
-        if path is not None:
-            loaded = load_file(path)
-        else:
+        if path is None:
             raise ValueError("Must provide a path")
+        from safetensors import safe_open
 
         data = {}
-        for key in loaded.keys():
-            data[key] = loaded[key]
+        with safe_open(path, framework="pt", device="cpu") as f:
+            metadata = f.metadata() or {}
+            for key in f.keys():
+                data[key] = f.get_tensor(key)
 
-        return cls(**data)
+        pe = cls(**data)
+        frozen = [k for k in metadata.get("frozen_dtype_keys", "").split(",") if k]
+        # integer tensors (e.g. token tags) must never be dtype-cast — freeze
+        # them even when the file predates the metadata field
+        for key, value in pe._store.items():
+            if key not in frozen and any(not v.is_floating_point() for v in value):
+                frozen.append(key)
+        pe.frozen_dtype_keys = frozen
+        return pe
 
     @classmethod
     def concat_prompt_embeds(
