@@ -14,6 +14,7 @@ from toolkit.dataloader_mixins import (
     ImageProcessingDTOMixin,
     LatentCachingFileItemDTOMixin,
     ControlFileItemDTOMixin,
+    ReferenceFileItemDTOMixin,
     ArgBreakMixin,
     MaskFileItemDTOMixin,
     AugmentationFileItemDTOMixin,
@@ -49,6 +50,7 @@ class FileItemDTO(
     ImageProcessingDTOMixin,
     AudioProcessingDTOMixin,
     ControlFileItemDTOMixin,
+    ReferenceFileItemDTOMixin,
     InpaintControlFileItemDTOMixin,
     ClipImageFileItemDTOMixin,
     MaskFileItemDTOMixin,
@@ -200,6 +202,7 @@ class FileItemDTO(
         self.cleanup_latent()
         self.cleanup_text_embedding()
         self.cleanup_control()
+        self.cleanup_references()
         self.cleanup_inpaint()
         self.cleanup_clip_image()
         self.cleanup_mask()
@@ -238,6 +241,12 @@ class DataLoaderBatchDTO:
             self.audio_tensor: Union[torch.Tensor, None] = None
             self.first_frame_latents: Union[torch.Tensor, None] = None
             self.audio_latents: Union[torch.Tensor, None] = None
+            # reference conditioning: one entry per reference, batched over
+            # items — latents (B, C, t, h, w) when cached, else raw pixels
+            # (B, T, C, H, W) in [0, 1]
+            self.reference_latents: Union[List[torch.Tensor], None] = None
+            self.reference_tensors: Union[List[torch.Tensor], None] = None
+            self.reference_kinds: Union[List[str], None] = None
 
             # just for holding noise and preds during training
             self.audio_target: Union[torch.Tensor, None] = None
@@ -313,6 +322,34 @@ class DataLoaderBatchDTO:
                             for x in self.file_items
                         ]
                     )
+                if any(
+                    [x._cached_reference_latents is not None for x in self.file_items]
+                ):
+                    # references are paired supervision: every item must carry
+                    # the same number of them (a zero-fill would train on a
+                    # blank reference)
+                    n_refs = None
+                    for x in self.file_items:
+                        got = (
+                            len(x._cached_reference_latents)
+                            if x._cached_reference_latents is not None
+                            else 0
+                        )
+                        if n_refs is None:
+                            n_refs = got
+                        if got != n_refs:
+                            raise Exception(
+                                f"Reference latent count mismatch in batch: {x.path}"
+                            )
+                    self.reference_latents = [
+                        torch.cat(
+                            [
+                                x._cached_reference_latents[ri].unsqueeze(0)
+                                for x in self.file_items
+                            ]
+                        )
+                        for ri in range(n_refs)
+                    ]
 
             self.prompt_embeds: Union[PromptEmbeds, None] = None
             # diff output preservation embeds (trigger word replaced with class)
@@ -346,6 +383,34 @@ class DataLoaderBatchDTO:
                         raise Exception(
                             f"Could not find control tensors for all file items, missing for {x.path}"
                         )
+
+            # reference pixels (loaded when latents or text embeds are not
+            # cached); every item must carry all of them
+            if any([getattr(x, 'reference_tensors', None) is not None for x in self.file_items]):
+                for x in self.file_items:
+                    if x.reference_tensors is None:
+                        raise Exception(
+                            f"Could not find reference media for all file items, missing for {x.path}"
+                        )
+                n_refs = len(self.file_items[0].reference_tensors)
+                if any(len(x.reference_tensors) != n_refs for x in self.file_items):
+                    raise Exception("Reference count mismatch across batch items")
+                self.reference_tensors = [
+                    torch.cat(
+                        [x.reference_tensors[ri].unsqueeze(0) for x in self.file_items]
+                    )
+                    for ri in range(n_refs)
+                ]
+                # bridge the raw references into the control channel so the
+                # trainer's existing control_images plumbing carries them into
+                # the text encoding (models that encode control in text
+                # embeddings build their reference presentation from these)
+                if self.control_tensor_list is None:
+                    self.control_tensor_list = [
+                        list(x.reference_tensors) for x in self.file_items
+                    ]
+            if any([getattr(x, 'has_references', False) for x in self.file_items]):
+                self.reference_kinds = self.file_items[0].reference_kinds
 
             self.inpaint_tensor: Union[torch.Tensor, None] = None
             if any([x.inpaint_tensor is not None for x in self.file_items]):
@@ -569,6 +634,8 @@ class DataLoaderBatchDTO:
         del self.audio_sigma
         del self.first_frame_latents
         del self.audio_latents
+        del self.reference_latents
+        del self.reference_tensors
         for file_item in self.file_items:
             file_item.cleanup()
 

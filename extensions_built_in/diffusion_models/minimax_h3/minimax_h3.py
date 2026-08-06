@@ -936,9 +936,12 @@ class MinimaxH3Model(BaseModel):
                         r.to(device, torch.float32) for r in ref_latents_src
                     ]
                 else:
+                    # raw reference pixels arrive in [0, 1]; the VAE wants [-1, 1]
                     ref_latents = [
                         self.encode_images(
-                            [item for item in r], device=device, dtype=torch.float32
+                            [item * 2.0 - 1.0 for item in r],
+                            device=device,
+                            dtype=torch.float32,
                         )
                         for r in ref_pixels_src
                     ]
