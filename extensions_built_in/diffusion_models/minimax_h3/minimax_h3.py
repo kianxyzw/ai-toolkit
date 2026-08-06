@@ -691,6 +691,16 @@ class MinimaxH3Model(BaseModel):
         # control tensors arrive in [0, 1]; the Qwen3-VL processor wants PIL
         keyframes_per_prompt = [None] * len(prompt)
         ref_items_per_prompt = [None] * len(prompt)
+        sample_refs = self.model_config.model_kwargs.get(
+            "sample_reference_videos", None
+        )
+        if control_images is None and sample_refs and self.is_ref2va:
+            # sample-prompt caching passes no control images, but a ref2va
+            # preview prompt addresses <Video k> tags — encode the configured
+            # preview references into the embeds now, while the text encoder
+            # is still loaded, or sampling later sees tags with no vision
+            # blocks behind them
+            control_images = [[self._load_reference_media(p) for p in sample_refs]]
         if control_images is not None and self.is_ref2va:
             # ref2va: the control channel carries the reference media — video
             # tensors (T, C, H, W) become <Video k> 2 fps presentations,
