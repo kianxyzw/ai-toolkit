@@ -1,0 +1,104 @@
+# MiniMax H3 ref2va (reference-to-video) LoRA training.
+#
+# Trains the Ref2VA partition on paired data: each training video has
+# name-matched reference media in one or more reference_path folders
+# (videos or images). References enter both the DiT (as pinned latent
+# rows on their own canvases) and the Qwen3-VL text conditioning (as
+# <Video k> / <Picture i> presentations at 2 fps) — captions should
+# address them by those tags, matching the released prompting guide.
+#
+# VRAM/RAM notes: the packed sequence holds every reference plus the
+# target, so reference-video training is much heavier than t2v/i2v.
+# With the original BF16 weights (model_kwargs.dit_path pointing at the
+# sharded MiniMaxAI/MiniMax-H3 Ref2VA/transformer folder) expect an
+# H200/141GB-class GPU and ~70GB of system RAM for the shard merge; the
+# Comfy-Org int8 repack (the default download) fits smaller cards.
+# cache_text_embeddings + cache_latents_to_disk are strongly recommended
+# so the Qwen3-VL encoder can unload before the DiT trains.
+---
+job: extension
+config:
+  name: "my_first_minimax_h3_ref2va_lora_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 32
+        linear_alpha: 32
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+      datasets:
+        # videos + name-matched .txt captions; reference_path folders hold
+        # name-matched reference media (first folder = <Video 1>, ...).
+        # Every training file must have a match in EVERY reference folder —
+        # files with a missing match are excluded with a printed error.
+        - folder_path: "/path/to/target/videos"
+          reference_path:
+            - "/path/to/reference/videos"    # <Video 1>
+            - "/path/to/second/references"   # <Video 2>
+          caption_ext: "txt"
+          # references are never truncated; keep clips pre-trimmed to the
+          # model's 17n+5 frame grid so no frames are resampled
+          num_frames: 73
+          fps: 24
+          resolution: [ 768 ]
+          cache_latents_to_disk: true
+      train:
+        batch_size: 1
+        steps: 2000
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'linear'
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        optimizer_params:
+          weight_decay: 1e-4
+        dtype: bf16
+        # encode all captions + reference presentations up front, then the
+        # Qwen3-VL-32B encoder unloads before the DiT trains
+        cache_text_embeddings: true
+        # silent targets: keep the joint audio stream out of the loss
+        audio_loss_multiplier: 0.0
+      model:
+        name_or_path: "Comfy-Org/MiniMax-H3"
+        arch: 'minimax_h3'
+        quantize: false
+        quantize_te: false
+        low_vram: true
+        model_kwargs:
+          partition: "ref2va"
+          # ORIGINAL BF16 weights (sharded): point dit_path at the
+          # transformer folder downloaded from MiniMaxAI/MiniMax-H3
+          # (Ref2VA/transformer). Comment out to use the Comfy-Org
+          # pruned int8 repack instead.
+          # dit_path: "/path/to/MiniMax-H3/Ref2VA/transformer"
+          # previews: reference media applied to every sample prompt
+          # (address them as <Video 1>, <Video 2>, ... in the prompts)
+          # sample_reference_videos:
+          #   - "/path/to/preview/reference1.mp4"
+          #   - "/path/to/preview/reference2.mp4"
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        sample_start_step: 0
+        width: 1280
+        height: 768
+        num_frames: 73
+        fps: 24
+        prompts:
+          - "[reference generation] <Video 1> provides the scene. Re-render it from the new camera trajectory."
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 1.0
+        sample_steps: 25
+meta:
+  name: "[name]"
+  version: '1.0'

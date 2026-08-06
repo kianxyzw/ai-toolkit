@@ -1214,6 +1214,46 @@ class MinimaxH3Model(BaseModel):
     def get_generation_pipeline(self):
         return MiniMaxH3Pipeline(self)
 
+    @staticmethod
+    def _load_reference_media(path: str) -> torch.Tensor:
+        """Video or image file -> (T, C, H, W) float [0, 1] at its native
+        canvas, center-cropped down to a /32 multiple."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".mp4", ".avi", ".mov", ".webm", ".mkv", ".wmv", ".m4v", ".flv"):
+            import cv2
+
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                raise Exception(f"Could not open reference video {path}")
+            frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames.append(
+                    torch.from_numpy(
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    ).permute(2, 0, 1)
+                )
+            cap.release()
+            if not frames:
+                raise Exception(f"Reference video has no frames: {path}")
+            t = torch.stack(frames).float() / 255.0
+        else:
+            import numpy as np
+            from PIL.ImageOps import exif_transpose
+
+            img = exif_transpose(Image.open(path)).convert("RGB")
+            t = (
+                torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
+            ).unsqueeze(0)
+        h, w = int(t.shape[2]), int(t.shape[3])
+        th, tw = (h // 32) * 32, (w // 32) * 32
+        if th == 0 or tw == 0:
+            raise ValueError(f"reference media too small: {h}x{w}")
+        top, left = (h - th) // 2, (w - tw) // 2
+        return t[:, :, top : top + th, left : left + tw]
+
     def generate_single_image(
         self,
         pipeline: MiniMaxH3Pipeline,
@@ -1245,6 +1285,21 @@ class MinimaxH3Model(BaseModel):
                 ctrl_img, gen_config.height, gen_config.width, stretch=True
             )
 
+        # ref2va previews: model_kwargs.sample_reference_videos (list of video
+        # or image paths, applied to every sample prompt) — references replace
+        # the keyframe and the conditioning is re-encoded with the reference
+        # presentation
+        ref_videos = None
+        sample_refs = self.model_config.model_kwargs.get(
+            "sample_reference_videos", None
+        )
+        if sample_refs and self.is_ref2va:
+            ref_videos = [self._load_reference_media(p) for p in sample_refs]
+            conditional_embeds = self.get_prompt_embeds(
+                [gen_config.prompt], control_images=[ref_videos]
+            )
+            ctrl_img = None
+
         with_audio = bool(self.model_config.model_kwargs.get("sample_audio", True))
 
         result = pipeline(
@@ -1258,6 +1313,7 @@ class MinimaxH3Model(BaseModel):
             latents=gen_config.latents,
             generator=generator,
             ctrl_img=ctrl_img,
+            ref_videos=ref_videos,
             with_audio=with_audio and is_video,
         )
         if is_video:
