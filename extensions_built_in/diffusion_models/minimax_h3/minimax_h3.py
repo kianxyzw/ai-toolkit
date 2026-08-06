@@ -1295,9 +1295,21 @@ class MinimaxH3Model(BaseModel):
         )
         if sample_refs and self.is_ref2va:
             ref_videos = [self._load_reference_media(p) for p in sample_refs]
-            conditional_embeds = self.get_prompt_embeds(
-                [gen_config.prompt], control_images=[ref_videos]
-            )
+            if hasattr(self.text_encoder, "config"):
+                conditional_embeds = self.get_prompt_embeds(
+                    [gen_config.prompt], control_images=[ref_videos]
+                )
+            else:
+                # the text encoder has been unloaded (cache_text_embeddings /
+                # unload_text_encoder): fall back to the pre-cached sample
+                # embeds. They lack the reference vision blocks in the text
+                # conditioning, but the reference latents still condition the
+                # DiT rows.
+                print(
+                    "MiniMax-H3: text encoder unloaded — sampling with cached "
+                    "prompt embeds (no reference vision blocks in text "
+                    "conditioning; reference latents still condition the DiT)"
+                )
             ctrl_img = None
 
         with_audio = bool(self.model_config.model_kwargs.get("sample_audio", True))
