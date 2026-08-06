@@ -75,6 +75,7 @@ class MiniMaxH3Pipeline:
         ctrl_img: Optional[
             Image.Image
         ] = None,  # first-frame keyframe, already canvas-sized
+        ref_videos: Optional[list] = None,  # ref2va: (T, C, H, W) [0, 1] tensors
         with_audio: bool = True,
         **kwargs,
     ):
@@ -100,6 +101,34 @@ class MiniMaxH3Pipeline:
         text_embeds = conditional_embeds.text_embeds[0].to(device, dtype)
         token_tags = conditional_embeds.text_token_tags[0].to("cpu", torch.long)
 
+        # --- ref2va reference conditioning ---------------------------------
+        # each reference keeps its own canvas; a single-frame tensor is an
+        # image reference (1.0 rotary units), multi-frame a video reference
+        if ref_videos and ctrl_img is not None:
+            raise ValueError("ctrl_img keyframes and ref_videos cannot be combined")
+        ref_blocks = []
+        ref_rows_list = []
+        for ref in ref_videos or []:
+            ref_latent = model.encode_images(
+                [(ref.float().clamp(0, 1) * 2.0 - 1.0)[0] if ref.shape[0] == 1 else ref.float().clamp(0, 1) * 2.0 - 1.0]
+            ).float().to(device)  # (1, 24, t, h, w)
+            rt_, rh_, rw_ = ref_latent.shape[2], ref_latent.shape[3], ref_latent.shape[4]
+            if rt_ == 1:
+                ref_blocks.append({"kind": "image", "latent_h": rh_, "latent_w": rw_})
+            else:
+                ref_blocks.append(
+                    {"kind": "video", "latent_t": rt_, "latent_h": rh_,
+                     "latent_w": rw_, "ref_audio_t": 0}
+                )
+            ref_noise = randn_tensor(
+                tuple(ref_latent.shape), generator=generator, dtype=torch.float32
+            ).to(device)
+            ref_latent = (
+                KEYFRAME_NOISE_AUG_T * ref_latent
+                + (1.0 - KEYFRAME_NOISE_AUG_T) * ref_noise
+            )
+            ref_rows_list.append(patchify_video_latents(ref_latent))
+
         # --- packed layout -------------------------------------------------
         anchors = ("first",) if ctrl_img is not None else ()
         layout = build_packed_sequence(
@@ -109,6 +138,7 @@ class MiniMaxH3Pipeline:
             latent_width=w_lat,
             num_audio_latents=a_lat,
             keyframe_anchors=anchors,
+            reference_blocks=tuple(ref_blocks),
         )
         num_cond = layout.num_condition_video_rows
 
@@ -167,6 +197,8 @@ class MiniMaxH3Pipeline:
             video_in = video_rows
             if cond_rows is not None:
                 video_in = torch.cat([cond_rows, video_rows], dim=1)
+            if ref_rows_list:
+                video_in = torch.cat(ref_rows_list + [video_in], dim=1)
 
             video_pred, audio_pred = transformer(
                 hidden_states=video_in.to(dtype),
