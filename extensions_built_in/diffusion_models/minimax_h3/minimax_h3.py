@@ -234,6 +234,9 @@ class MinimaxH3Model(BaseModel):
         downloaded to the repo-relative path under MODELS_PATH.
         """
         override = self.model_config.model_kwargs.get(f"{component}_path", None)
+        if override is None and component.startswith("dit_"):
+            # generic alias: dit_path applies to whichever partition is active
+            override = self.model_config.model_kwargs.get("dit_path", None)
         if override is not None:
             if not os.path.exists(override):
                 raise FileNotFoundError(
