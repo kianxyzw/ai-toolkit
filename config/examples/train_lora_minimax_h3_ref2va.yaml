@@ -98,7 +98,7 @@ config:
         seed: 42
         walk_seed: true
         guidance_scale: 1.0
-        sample_steps: 25
+        sample_steps: 25  # N evaluations; below ~20 the shift-12 grid is too coarse
 meta:
   name: "[name]"
   version: '1.0'
