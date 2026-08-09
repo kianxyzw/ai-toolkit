@@ -569,11 +569,31 @@ def remap_sigma(
 
 
 def build_sigma_schedule(
-    num_inference_steps: int, shift: float = VIDEO_SIGMA_SHIFT
+    num_inference_steps: int,
+    shift: float = VIDEO_SIGMA_SHIFT,
+    multiplier: int = 1000,
 ) -> torch.Tensor:
-    """The released sampling grid: linspace(1, 0, steps) through the
-    exponential shift, consecutive duplicates collapsed — the terminal 0 is
-    part of the count, so `steps` yields `steps - 1` model evaluations."""
-    base = torch.linspace(1.0, 0.0, num_inference_steps, dtype=torch.float32)
+    """The released sampling grid: sweep the shifted schedule down to its
+    minimum sigma, then step to zero. `steps` yields `steps` evaluations.
+
+    The sweep must stop at sigma_min = shift(1/multiplier), NOT at zero.
+    Running linspace to zero looks equivalent — shift(0) is 0 either way — but
+    it silently deletes the final low-noise evaluation, because the last
+    non-zero point then lands wherever the grid spacing happens to fall
+    instead of near sigma_min. At shift 12 that is catastrophic: the schedule
+    is heavily front-loaded, so the last evaluation sits at sigma 0.60 (10
+    steps) or 0.24 (40 steps) and the sampler must leap to a clean frame in
+    one jump, skipping the entire detail-forming region. Output is flat grey.
+    The reference grid always ends ...0.126 -> 0 regardless of step count.
+    """
+    # sigma_min is itself a shifted value (the reference builds its sigma
+    # table by shifting timesteps 1..multiplier, so the smallest entry is
+    # shift(1/multiplier)); sweeping to it and shifting again is what puts the
+    # final evaluation at ~0.126 rather than ~0.012. Reproduced rather than
+    # "improved" on purpose — this matches ComfyUI, the implementation that
+    # demonstrably generates good H3 video.
+    sigma_min = float(shift_sigma(torch.tensor(1.0 / multiplier), shift))
+    base = torch.linspace(1.0, sigma_min, num_inference_steps, dtype=torch.float32)
     sigmas = shift_sigma(base, shift)
+    sigmas = torch.cat([sigmas, torch.zeros(1, dtype=torch.float32)])
     return torch.unique_consecutive(sigmas)
