@@ -1,19 +1,21 @@
-"""adaln_bias must be read from the checkpoint, not inferred from pruned-ness.
+"""adaln_bias must match what load_state_dict actually sees, across ALL
+checkpoint families. Regression suite for two pod-costing failures.
 
-Regression for the R3 blocker (h3-crossview, 2026-08-11). The fork could not
-load MiniMaxAI/MiniMax-H3's non-pruned BF16 Ref2VA shards at all:
+Three families disagree, and every simpler rule gets one wrong:
 
-  ValueError: MiniMax-H3 transformer load mismatch: missing [],
-    unexpected ['blocks.0.adaln_proj.linear.bias', ...]
+  pruned int8       t-table, adaln linears stay fp16    bias PRESENT
+  non-pruned int8   no t-table, adaln linears ConvRot   bias ABSENT
+  BF16 shards       no t-table, nothing quantized       bias PRESENT
 
-`adaln_bias` was `adaln_t_table_size is not None` — bias only for PRUNED
-checkpoints — on the stated assumption that "the original weights lack" the
-block bias. The real non-pruned checkpoint carries it, so the model was built
-without the parameter and every real bias tensor was rejected. Three pod
-attempts died at 8 seconds each before this was visible.
+History, both paid for on pods:
+  attempt 3  upstream rule (bias = pruned) built the BF16 model WITHOUT bias
+             -> "unexpected [blocks.N.adaln_proj.linear.bias, ...]"
+  item 6     raw-key rule built the non-pruned int8 model WITH bias, because
+             the key IS in the raw dict but import_comfy_quantized_layers
+             consumes it -> "missing [blocks.N.adaln_proj.linear.bias, ...]"
 
-Pruned-ness only ever CORRELATED with the bias. The key itself is the ground
-truth, so that is what the loader now reads.
+The rule under test asks the question load_state_dict will ask: the bias
+survives only if the key exists AND its module is not ConvRot-quantized.
 
 Usage:  python testing/test_h3_adaln_bias.py
 """
@@ -25,91 +27,102 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
+from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import (
+    _adaln_block_bias,
+)
 from extensions_built_in.diffusion_models.minimax_h3.src.transformer import (
+    MiniMaxH3AdalnProj,
     MiniMaxH3TransformerParams,
 )
 
-# verbatim from the R3 attempt-3 pod traceback (truncated at 8 by the error
-# formatter); these are exactly the keys that had nowhere to go
-ATTEMPT3_UNEXPECTED = [
-    "blocks.0.adaln_proj.linear.bias",
-    "blocks.1.adaln_proj.linear.bias",
-    "blocks.2.adaln_proj.linear.bias",
-    "blocks.3.adaln_proj.linear.bias",
-    "blocks.4.adaln_proj.linear.bias",
-    "blocks.5.adaln_proj.linear.bias",
-    "blocks.6.adaln_proj.linear.bias",
-    "blocks.7.adaln_proj.linear.bias",
-]
+# verbatim from the attempt-3 pod traceback (formatter truncates at 8)
+ATTEMPT3_UNEXPECTED = [f"blocks.{i}.adaln_proj.linear.bias" for i in range(8)]
+# verbatim from the item-6 pod traceback - same names, opposite direction
+ITEM6_MISSING = list(ATTEMPT3_UNEXPECTED)
 
 
-def infer(state_dict_keys):
-    """Mirror of the loader's inference (minimax_h3.py::_load_transformer)."""
-    return any(
-        k.startswith("blocks.") and k.endswith("adaln_proj.linear.bias")
-        for k in state_dict_keys
-    )
+def family_pruned_int8():
+    """t-table present; adaln linears are fp16, so NOT ConvRot-marked."""
+    sd = {"adaln_t_table": None}
+    for i in range(4):
+        sd[f"blocks.{i}.adaln_proj.linear.weight"] = None
+        sd[f"blocks.{i}.adaln_proj.linear.bias"] = None
+        # a genuinely quantized sibling, to prove the marker is matched per
+        # MODULE and not merely "does any comfy_quant key exist"
+        sd[f"blocks.{i}.attn.qkv.comfy_quant"] = None
+        sd[f"blocks.{i}.attn.qkv.weight"] = None
+    sd["final_layer.adaln_proj.linear.bias"] = None
+    return sd
+
+
+def family_nonpruned_int8():
+    """No t-table; the adaln linears themselves ARE ConvRot-quantized, so the
+    import consumes their bias before load_state_dict ever sees it."""
+    sd = {}
+    for i in range(4):
+        sd[f"blocks.{i}.adaln_proj.linear.weight"] = None
+        sd[f"blocks.{i}.adaln_proj.linear.bias"] = None
+        sd[f"blocks.{i}.adaln_proj.linear.comfy_quant"] = None
+    sd["final_layer.adaln_proj.linear.bias"] = None
+    return sd
+
+
+def family_bf16_shards():
+    """No t-table, nothing quantized anywhere."""
+    sd = {}
+    for i in range(4):
+        sd[f"blocks.{i}.adaln_proj.linear.weight"] = None
+        sd[f"blocks.{i}.adaln_proj.linear.bias"] = None
+    sd["final_layer.adaln_proj.linear.bias"] = None
+    return sd
 
 
 def main():
-    # --- 1. the regression case: non-pruned checkpoint WITH block bias -----
-    non_pruned = ["blocks.0.adaln_proj.linear.weight", "final_layer.adaln_proj.linear.weight",
-                  "final_layer.adaln_proj.linear.bias"] + ATTEMPT3_UNEXPECTED
-    p = MiniMaxH3TransformerParams()
-    p.adaln_bias_from_checkpoint = infer(non_pruned)
-    assert p.adaln_t_table_size is None, "this fixture is the NON-pruned shape"
-    assert p.adaln_bias is True, (
-        "the exact configuration that blocked R3 still resolves to bias=False")
-    print("  [ok] non-pruned + block bias -> adaln_bias True "
-          "(the R3 blocker; the old rule said False)")
+    cases = [
+        ("(a) pruned int8      ", family_pruned_int8(), True),
+        ("(b) non-pruned int8  ", family_nonpruned_int8(), False),
+        ("(c) BF16 shards      ", family_bf16_shards(), True),
+    ]
+    for name, sd, want in cases:
+        got = _adaln_block_bias(sd)
+        assert got is want, f"{name}: adaln_bias={got}, expected {want}"
+        print(f"  [ok] {name} -> adaln_bias {got}")
 
-    # --- 2. non-pruned WITHOUT block bias ----------------------------------
-    # the shape upstream assumed was universal. The final layer's bias is
-    # present here and must NOT be mistaken for a block bias.
-    no_block_bias = ["blocks.0.adaln_proj.linear.weight",
-                     "final_layer.adaln_proj.linear.weight",
-                     "final_layer.adaln_proj.linear.bias"]
-    p = MiniMaxH3TransformerParams()
-    p.adaln_bias_from_checkpoint = infer(no_block_bias)
-    assert p.adaln_bias is False, "the final layer's bias leaked into the answer"
-    print("  [ok] non-pruned, no block bias -> False (final-layer bias ignored)")
+    # (d) the two historical regressions, as their verbatim key lists
+    hist = {k: None for k in ATTEMPT3_UNEXPECTED}
+    hist.update({f"blocks.{i}.adaln_proj.linear.weight": None for i in range(8)})
+    assert _adaln_block_bias(hist) is True, (
+        "attempt-3 regression: unquantized bias keys must resolve to True")
+    print("  [ok] (d) attempt-3 unexpected-keys list -> True (was False, the bug)")
 
-    # --- 3. pruned checkpoint, bias present --------------------------------
-    pruned = ["adaln_t_table"] + ATTEMPT3_UNEXPECTED
-    p = MiniMaxH3TransformerParams()
-    p.adaln_t_table_size = 8
-    p.adaln_bias_from_checkpoint = infer(pruned)
-    assert p.adaln_bias is True
-    assert p.adaln_apply_silu is False, "pruned checkpoints skip the SiLU"
-    print("  [ok] pruned + block bias -> True (unchanged from before)")
+    quantized_hist = dict(hist)
+    quantized_hist.update(
+        {f"blocks.{i}.adaln_proj.linear.comfy_quant": None for i in range(8)})
+    assert _adaln_block_bias(quantized_hist) is False, (
+        "item-6 regression: ConvRot-consumed bias keys must resolve to False")
+    print("  [ok] (d) item-6 missing-keys list -> False (was True, the bug)")
 
-    # --- 4. fallback when nothing was inferred -----------------------------
-    # None must keep the OLD behaviour, so an unrelated caller that never sets
-    # it is not silently changed by this fix
-    p = MiniMaxH3TransformerParams()
-    assert p.adaln_bias is False
-    p.adaln_t_table_size = 8
-    assert p.adaln_bias is True
-    print("  [ok] uninferred (None) falls back to the pruned-ness heuristic")
+    # neither historical rule passes all four - proof the new one is not just
+    # a restatement of either
+    for label, rule in (
+        ("upstream (bias = pruned)", lambda sd: "adaln_t_table" in sd),
+        ("raw-key (bias = key present)",
+         lambda sd: any(k.startswith("blocks.") and k.endswith("adaln_proj.linear.bias")
+                        for k in sd)),
+    ):
+        wrong = [n for n, sd, want in cases if rule(sd) is not want]
+        assert wrong, f"{label} unexpectedly passes everything"
+        print(f"  [ok] {label} still fails {len(wrong)} case(s): {wrong[0].strip()}")
 
-    # --- 5. the module actually builds the parameter both ways -------------
-    from extensions_built_in.diffusion_models.minimax_h3.src.transformer import (
-        MiniMaxH3AdalnProj,
-    )
-    with_bias = MiniMaxH3AdalnProj(8, 4, expand=6, modalities=3, bias=True)
-    without = MiniMaxH3AdalnProj(8, 4, expand=6, modalities=3, bias=False)
-    assert with_bias.linear.bias is not None and without.linear.bias is None
-    # and a state dict carrying a bias loads into the bias-ful module cleanly
-    sd = {"linear.weight": torch.zeros_like(with_bias.linear.weight),
-          "linear.bias": torch.zeros_like(with_bias.linear.bias)}
-    res = with_bias.load_state_dict(sd, strict=False)
-    assert not res.unexpected_keys, f"unexpected: {res.unexpected_keys}"
-    res = without.load_state_dict(sd, strict=False)
-    assert "linear.bias" in res.unexpected_keys, (
-        "the bias-less module should reject a bias - that is the failure being fixed")
-    print("  [ok] bias-ful module accepts the bias; bias-less one rejects it")
+    # the parameter actually reaches the module both ways
+    for want in (True, False):
+        p = MiniMaxH3TransformerParams()
+        p.adaln_bias_from_checkpoint = want
+        m = MiniMaxH3AdalnProj(8, 4, expand=6, modalities=3, bias=p.adaln_bias)
+        assert (m.linear.bias is not None) is want
+    print("  [ok] the resolved flag reaches nn.Linear(bias=...)")
 
-    print("TEST PASS - adaln_bias is read from the checkpoint, not from pruned-ness")
+    print("TEST PASS - adaln_bias correct across all four checkpoint families")
 
 
 if __name__ == "__main__":

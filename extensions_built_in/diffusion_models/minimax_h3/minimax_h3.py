@@ -110,6 +110,44 @@ COMFY_FILES = {
 ORIGINAL_REPO = "MiniMaxAI/MiniMax-H3"
 
 
+def _adaln_block_bias(state_dict) -> bool:
+    """Do the BLOCK AdaLN linears carry a bias, as load_state_dict will see it?
+
+    Three checkpoint families disagree, and every simpler rule gets one wrong:
+
+      pruned int8       t-table, adaln linears stay fp16    bias PRESENT
+      non-pruned int8   no t-table, adaln linears ConvRot   bias ABSENT
+      BF16 shards       no t-table, nothing quantized       bias PRESENT
+
+    Upstream derives it from pruned-ness, which is right for their two int8
+    families and wrong for the BF16 shards (a family upstream neither ships nor
+    loads). Asking the raw dict for the bias key is right for the shards and
+    wrong for non-pruned int8: the key is THERE in the raw dict but
+    `import_comfy_quantized_layers` consumes it on the way through, so
+    load_state_dict never sees it and reports it missing. That regression cost
+    a pod run.
+
+    So ask the question load_state_dict will actually ask: the bias survives
+    only if the key exists AND its module is not ConvRot-quantized. A quantized
+    module is marked by a sibling `<prefix>.comfy_quant` entry, which is
+    exactly what the import consumes.
+
+    Only `blocks.*` count - the final layer's AdaLN carries a bias in every
+    variant, so including it would answer "yes" for everything.
+    """
+    quantized = {
+        k[: -len(".comfy_quant")]
+        for k in state_dict
+        if k.endswith(".comfy_quant")
+    }
+    for k in state_dict:
+        if not (k.startswith("blocks.") and k.endswith("adaln_proj.linear.bias")):
+            continue
+        if k[: -len(".bias")] not in quantized:
+            return True
+    return False
+
+
 def new_save_image_function(
     self: GenerateImageConfig, image, count=0, max_count=0, **kwargs
 ):
@@ -441,14 +479,7 @@ class MinimaxH3Model(BaseModel):
             # pruned checkpoint: factored timestep table instead of the MLP
             params.adaln_t_table_size = table.shape[0]
             params.time_embed_dim = table.shape[1]
-        # Ask the checkpoint whether the BLOCK AdaLN linears have a bias rather
-        # than inferring it from pruned-ness. Only `blocks.*` count: the final
-        # layer's AdaLN carries a bias in every variant, so including it would
-        # answer "yes" for every checkpoint.
-        params.adaln_bias_from_checkpoint = any(
-            k.startswith("blocks.") and k.endswith("adaln_proj.linear.bias")
-            for k in state_dict
-        )
+        params.adaln_bias_from_checkpoint = _adaln_block_bias(state_dict)
 
         with torch.device("meta"):
             transformer = MiniMaxH3Transformer(params)
