@@ -1099,6 +1099,30 @@ class DatasetConfig:
         if self.reference_path == '':
             self.reference_path = None
 
+        # --- per-sample reference dropout -------------------------------
+        # One probability PER REFERENCE STREAM, not one for the whole set:
+        # a scalar here would only ever express "train unconditioned t2v x% of
+        # the time", which is the wrong regime when some references are
+        # mandatory (the source carries the content) and others are an
+        # optional assist (a warp guide the model is known to over-imitate).
+        # A list is padded/truncated to len(reference_path).
+        self.reference_dropout: Union[float, List[float]] = kwargs.get('reference_dropout', 0.0)
+        # Optional linear anneal toward `reference_dropout_end` over
+        # `reference_dropout_anneal_steps`. This is what makes a warp-scaffold
+        # curriculum expressible: hold the warp present early (p_drop ~ 0) and
+        # anneal it out (p_drop -> 0.7), transferring reliance onto the raymap.
+        self.reference_dropout_end: Union[float, List[float], None] = kwargs.get(
+            'reference_dropout_end', None)
+        self.reference_dropout_anneal_steps: int = int(
+            kwargs.get('reference_dropout_anneal_steps', 0))
+        # Per-stream caption-variant suffix used when THAT stream is dropped,
+        # e.g. [null, null, "nowarp"] -> load "<stem>.nowarp.txt". Variants are
+        # PRECOMPUTED files, never edited at load time: dropping <Video 3>
+        # renumbers reference ordinals, so the caption must be the one written
+        # for that exact reference set.
+        self.reference_caption_variants: Union[List[Union[str, None]], None] = kwargs.get(
+            'reference_caption_variants', None)
+
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
     """

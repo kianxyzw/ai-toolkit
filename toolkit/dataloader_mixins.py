@@ -1259,6 +1259,92 @@ class ReferenceFileItemDTOMixin:
             self.reference_paths = found
             self.reference_kinds = kinds
             self.has_references = True
+            # active_* is what load_references actually decodes. Until
+            # select_references() runs it is the full set, so behaviour with
+            # dropout unconfigured is bit-identical to before.
+            self.active_reference_paths = list(found)
+            self.active_reference_kinds = list(kinds)
+
+    @staticmethod
+    def _stream_probs(value, n: int, default: float = 0.0) -> List[float]:
+        """Scalar or list -> exactly n per-stream probabilities."""
+        if value is None:
+            return [default] * n
+        if isinstance(value, (int, float)):
+            return [float(value)] * n
+        out = [float(v) for v in value][:n]
+        return out + [default] * (n - len(out))
+
+    def reference_drop_probs(self: 'FileItemDTO', step: int = 0) -> List[float]:
+        """Per-stream drop probability at ``step`` (linear anneal if configured)."""
+        n = len(self.reference_paths or [])
+        cfg = self.dataset_config
+        start = self._stream_probs(getattr(cfg, 'reference_dropout', 0.0), n)
+        end_raw = getattr(cfg, 'reference_dropout_end', None)
+        steps = int(getattr(cfg, 'reference_dropout_anneal_steps', 0) or 0)
+        if end_raw is None or steps <= 0:
+            return start
+        end = self._stream_probs(end_raw, n)
+        # clamp so a step past the horizon holds at the end value rather than
+        # extrapolating to a nonsense probability
+        frac = min(max(float(step) / float(steps), 0.0), 1.0)
+        return [s + (e - s) * frac for s, e in zip(start, end)]
+
+    def select_references(self: 'FileItemDTO', step: int = 0, seed: int = 0) -> List[int]:
+        """Draw this sample's reference dropout. Returns dropped stream indices.
+
+        Deterministic in (seed, file path, step): the same sample at the same
+        step always draws the same way, so a resumed run reproduces its data
+        and a test can assert an exact sequence. Per-sample, not per-batch —
+        `has_references` was fixed per file item before this, which is why the
+        mechanism had to be built before any dropout curriculum (open q. 5).
+        """
+        if not self.has_references:
+            return []
+        n = len(self.reference_paths)
+        probs = self.reference_drop_probs(step)
+        dropped: List[int] = []
+        if any(p > 0.0 for p in probs):
+            key = f"{seed}|{self.path}|{step}"
+            rng = random.Random(hashlib.sha256(key.encode('utf-8')).hexdigest())
+            for i, p in enumerate(probs):
+                if p > 0.0 and rng.random() < p:
+                    dropped.append(i)
+        keep = [i for i in range(n) if i not in dropped]
+        self.active_reference_paths = [self.reference_paths[i] for i in keep]
+        self.active_reference_kinds = [self.reference_kinds[i] for i in keep]
+        self.reference_tensors = None  # force a re-decode for the new set
+        self.dropped_reference_streams = dropped
+        self._apply_reference_caption_variant(dropped)
+        return dropped
+
+    def _apply_reference_caption_variant(self: 'FileItemDTO', dropped: List[int]) -> None:
+        """Swap in the precomputed caption written for this reference set.
+
+        Dropping a reference RENUMBERS the ordinals every later tag uses, so a
+        caption that still says "<Video 3>" after <Video 3> is gone is training
+        the model on a tag that is not there. The variants are precomputed
+        files; this only chooses between them.
+        """
+        variants = getattr(self.dataset_config, 'reference_caption_variants', None)
+        if not variants or not dropped:
+            return
+        suffixes = [variants[i] for i in dropped
+                    if i < len(variants) and variants[i]]
+        if not suffixes:
+            return
+        stem = os.path.splitext(self.path)[0]
+        path = f"{stem}.{'.'.join(sorted(suffixes))}.txt"
+        if not os.path.exists(path):
+            # loud, not silent: training on the wrong caption is invisible in
+            # the loss and poisons exactly the samples dropout was meant to fix
+            print_acc(f"reference_caption_variants: dropped streams {dropped} "
+                      f"but no caption variant at {path} - KEEPING THE FULL "
+                      f"CAPTION, which still names the dropped reference")
+            return
+        with open(path, 'r', encoding='utf-8') as f:
+            self.raw_caption = f.read().strip()
+        self.caption = self.get_caption()
 
     @staticmethod
     def _crop_to_multiple(t: torch.Tensor, multiple: int = 32) -> torch.Tensor:
@@ -1278,7 +1364,11 @@ class ReferenceFileItemDTOMixin:
         if not self.has_references or self.reference_tensors is not None:
             return
         tensors = []
-        for path, kind in zip(self.reference_paths, self.reference_kinds):
+        # active_* is the post-dropout set; it falls back to the full set for
+        # items whose select_references() has not run (dropout unconfigured)
+        paths = getattr(self, 'active_reference_paths', None) or self.reference_paths
+        kinds = getattr(self, 'active_reference_kinds', None) or self.reference_kinds
+        for path, kind in zip(paths, kinds):
             if kind == 'video':
                 cap = cv2.VideoCapture(path)
                 if not cap.isOpened():
