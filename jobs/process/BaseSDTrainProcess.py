@@ -2527,6 +2527,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ###################################################################
 
 
+        # --- OOM forensics (opt-in, AITK_MEMORY_HISTORY=1) -----------------
+        # ai-toolkit catches OutOfMemoryError and prints only its own banner,
+        # so the one fact that matters - the size of the allocation that
+        # failed, and what was already resident - never reaches the log. That
+        # is why the 83-96GB nondeterministic OOMs on the 96GB card could not
+        # be explained: every controlled variable was ruled out with no view
+        # of the allocator at all. Recording costs nothing when off, and when
+        # on it gives the full allocation timeline including the failing
+        # request, independent of whatever the exception text says.
+        self._memory_history_on = os.environ.get("AITK_MEMORY_HISTORY", "0") == "1"
+        if self._memory_history_on and torch.cuda.is_available():
+            try:
+                torch.cuda.memory._record_memory_history(
+                    max_entries=int(os.environ.get("AITK_MEMORY_HISTORY_ENTRIES", "100000"))
+                )
+                print_acc("memory history recording ON (AITK_MEMORY_HISTORY=1)")
+            except Exception as e:  # older torch: not fatal, just unavailable
+                self._memory_history_on = False
+                print_acc(f"could not start memory history recording: {e}")
+
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
@@ -2631,14 +2651,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as e:
                 did_oom = True
+                oom_error = e
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
                     did_oom = True
+                    oom_error = e
                 else:
                     raise  # not an OOM; surface real errors
             if did_oom:
+                # PRINT THE EXCEPTION. The banner below says an OOM happened;
+                # only this says how big the failed allocation was and how
+                # much was reserved vs free - the difference between "the
+                # config is too big" and "the allocator fragmented".
+                print_acc(f"# OOM detail: {oom_error}")
+                if getattr(self, "_memory_history_on", False):
+                    snap = os.path.join(
+                        self.save_root, f"oom_snapshot_step{self.step_num}.pickle")
+                    try:
+                        torch.cuda.memory._dump_snapshot(snap)
+                        print_acc(f"# allocation timeline -> {snap} "
+                                  f"(open at https://docs.pytorch.org/memory_viz)")
+                    except Exception as se:
+                        print_acc(f"# could not dump memory snapshot: {se}")
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
