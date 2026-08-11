@@ -327,7 +327,18 @@ class MinimaxH3Model(BaseModel):
 
     @property
     def is_ref2va(self) -> bool:
-        return self._dit_component() == "dit_ref2va"
+        """Does the active partition carry the reference blocks?
+
+        Pruning removes the timestep MLP, not the reference conditioning: both
+        ``ref2va`` and ``ref2va_pruned`` were trained with reference blocks, and
+        both fl2va variants were not. Written as an exact match against
+        ``dit_ref2va`` while ``ref2va`` (the BF16 shards) was the only reference
+        partition we ran, which silently made ``ref2va_pruned`` behave as fl2va:
+        training refs raise "needs partition: ref2va" and — worse, because it is
+        silent — sample_reference_videos is dropped and the preview renders
+        unconditioned.
+        """
+        return self._dit_component().startswith("dit_ref2va")
 
     def load_training_adapter(self, transformer: MiniMaxH3Transformer):
         """Load an assistant LoRA (e.g. a de-distillation adapter) as a LIVE
