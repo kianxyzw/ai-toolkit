@@ -21,6 +21,7 @@ from safetensors.torch import save_file, load_file
 from torch.utils.data import DataLoader
 import torch
 import torch.backends.cuda
+import torch.backends.cudnn
 from huggingface_hub import HfApi, interpreter_login
 from toolkit.memory_management import MemoryManager
 
@@ -2536,6 +2537,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # of the allocator at all. Recording costs nothing when off, and when
         # on it gives the full allocation timeline including the failing
         # request, independent of whatever the exception text says.
+        # --- cuDNN autotune probe (opt-in, AITK_CUDNN_DETERMINISTIC=1) -----
+        # Unexplored suspect for the nondeterministic 83-96GB OOMs on the 96GB
+        # card (REVIEW F6): torch.backends.cudnn.benchmark picks algorithms
+        # per-run by timing them, and the candidates differ in workspace size
+        # by GBs. That matches the observed signature exactly - identical
+        # config, peaks spread across 13GB, no correlation with any controlled
+        # variable. Pinning it off removes the per-run algorithm search.
+        if os.environ.get("AITK_CUDNN_DETERMINISTIC", "0") == "1":
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except Exception as e:
+                print_acc(f"use_deterministic_algorithms unavailable: {e}")
+            print_acc("cuDNN autotune OFF, deterministic algorithms ON "
+                      "(AITK_CUDNN_DETERMINISTIC=1)")
+        else:
+            print_acc(f"cudnn.benchmark = {torch.backends.cudnn.benchmark} (default)")
+
         self._memory_history_on = os.environ.get("AITK_MEMORY_HISTORY", "0") == "1"
         if self._memory_history_on and torch.cuda.is_available():
             try:
