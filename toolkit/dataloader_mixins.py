@@ -2457,9 +2457,18 @@ class TextEmbeddingCachingMixin:
                                 for r in file_item.reference_tensors
                             ]
                         ]
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
-                            file_item.caption, control_images=ref_list
-                        )
+                        # every other branch loops encode_targets and SAVES; this
+                        # one encoded a single embedding and dropped it on the
+                        # floor, then set is_text_embedding_cached = True. The
+                        # caching pass reported 4/4 and spent 32s doing real work
+                        # while writing nothing, and training died on the first
+                        # batch with FileNotFoundError for the cache file.
+                        for path, caption in encode_targets:
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
+                                caption, control_images=ref_list
+                            )
+                            prompt_embeds.save(path)
+                            del prompt_embeds
                         file_item.cleanup_references()
                     elif file_item.encode_control_in_text_embeddings and file_item.control_path is not None:
                         ctrl_img_list = []
