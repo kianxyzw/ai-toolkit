@@ -45,6 +45,8 @@ Quantized state attached to each module:
 
 from typing import Optional
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -268,14 +270,58 @@ def dequantize_nvfp4(
 _triton_ok = None
 
 
+def _probe_compile() -> bool:
+    """Actually compile and launch a trivial kernel.
+
+    The guard below used to test whether triton IMPORTS. What decides whether
+    the fused path works is whether its kernels COMPILE, and those are
+    different questions: a NameError on a free variable inside a jit kernel
+    happens at first compile, long after a clean import. When they diverge the
+    documented "fall back to plain torch ops" path is unreachable in precisely
+    the situation it exists for, and the caller dies instead of degrading.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return True  # kernels are only reached on cuda tensors anyway
+        triton, tl = _import_triton()
+
+        @triton.jit
+        def _probe(x_ptr, y_ptr, N, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            m = offs < N
+            v = tl.load(x_ptr + offs, mask=m, other=0.0).to(tl.float32)
+            tl.store(y_ptr + offs, libdevice.rint(tl.abs(v)), mask=m)
+
+        x = torch.randn(8, device="cuda", dtype=torch.float32)
+        y = torch.empty_like(x)
+        _probe[(1,)](x, y, 8, BLOCK=8)
+        torch.cuda.synchronize()
+        return True
+    except Exception as e:
+        print_acc(
+            f"ConvRot: triton imports but its kernels do not compile here "
+            f"({type(e).__name__}: {str(e).splitlines()[0][:120]}). Falling back "
+            "to plain torch ops - slower inference, quality and training "
+            "unaffected."
+        )
+        return False
+
+
 def _triton_available() -> bool:
     global _triton_ok
     if _triton_ok is None:
+        if os.environ.get("AITK_CONVROT_FALLBACK", "0") == "1":
+            _triton_ok = False
+            print_acc("ConvRot: fused triton kernels disabled by "
+                      "AITK_CONVROT_FALLBACK=1; using the plain-torch fallback.")
+            return _triton_ok
         try:
             import triton  # noqa: F401
             import triton.language as tl  # noqa: F401
 
-            _triton_ok = True
+            _triton_ok = _probe_compile()
         except Exception:
             _triton_ok = False
             print_acc(
@@ -299,6 +345,18 @@ def _import_triton():
 
     globals()["triton"] = _triton
     globals()["tl"] = _tl
+    # ...and libdevice, for exactly the reason above. Several kernel builders
+    # do `from triton.language.extra import libdevice` INSIDE the function, so
+    # the name is a local; a jit kernel referencing it resolves through
+    # fn.__globals__ on those triton versions and dies with
+    # "NameError: libdevice is not defined" at first compile. That failure is
+    # what pushed h3-crossview off ConvRot onto optimum-quanto entirely.
+    try:
+        from triton.language.extra import libdevice as _libdevice
+
+        globals()["libdevice"] = _libdevice
+    except Exception:  # older/newer layouts: the builders' local import still wins
+        pass
     return _triton, _tl
 
 
