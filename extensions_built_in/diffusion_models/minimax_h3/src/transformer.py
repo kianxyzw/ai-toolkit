@@ -66,6 +66,18 @@ class MiniMaxH3TransformerParams:
     # and add a bias to the block AdaLN linears, which the original weights
     # lack (the final layer's AdaLN carries a bias in both variants).
     adaln_t_table_size: Optional[int] = None
+    # Whether the BLOCK AdaLN linears carry a bias, read from the checkpoint's
+    # own keys by the loader. None = unknown, fall back to the pruned-ness
+    # heuristic below.
+    #
+    # That heuristic is a PROXY and it was wrong: the comment above asserts the
+    # original weights lack the block bias, but MiniMaxAI/MiniMax-H3's
+    # non-pruned BF16 Ref2VA shards DO carry `blocks.N.adaln_proj.linear.bias`.
+    # Deriving bias from pruned-ness therefore built the model without it and
+    # the strict key check rejected every real bias tensor as "unexpected" —
+    # the fork could not load the weights at all. Presence of the key is the
+    # ground truth; pruned-ness only ever correlated with it.
+    adaln_bias_from_checkpoint: Optional[bool] = None
 
     @property
     def adaln_apply_silu(self) -> bool:
@@ -73,6 +85,8 @@ class MiniMaxH3TransformerParams:
 
     @property
     def adaln_bias(self) -> bool:
+        if self.adaln_bias_from_checkpoint is not None:
+            return self.adaln_bias_from_checkpoint
         return self.adaln_t_table_size is not None
 
 

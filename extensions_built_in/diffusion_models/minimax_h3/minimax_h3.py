@@ -441,6 +441,14 @@ class MinimaxH3Model(BaseModel):
             # pruned checkpoint: factored timestep table instead of the MLP
             params.adaln_t_table_size = table.shape[0]
             params.time_embed_dim = table.shape[1]
+        # Ask the checkpoint whether the BLOCK AdaLN linears have a bias rather
+        # than inferring it from pruned-ness. Only `blocks.*` count: the final
+        # layer's AdaLN carries a bias in every variant, so including it would
+        # answer "yes" for every checkpoint.
+        params.adaln_bias_from_checkpoint = any(
+            k.startswith("blocks.") and k.endswith("adaln_proj.linear.bias")
+            for k in state_dict
+        )
 
         with torch.device("meta"):
             transformer = MiniMaxH3Transformer(params)
