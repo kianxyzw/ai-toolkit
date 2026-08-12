@@ -519,6 +519,31 @@ class MinimaxH3Model(BaseModel):
             )
         del state_dict
         flush()
+
+        # R6b camera encoder. Attached AFTER load_state_dict on purpose: it is
+        # not in the checkpoint, so attaching it first would list all 52 of its
+        # tensors as `missing` and the strict check above would refuse a
+        # perfectly good checkpoint — the same false-positive shape as the
+        # ConvRot sidecar gate ($0.38, 2026-08-12).
+        if self.model_config.model_kwargs.get("camera_encoder", False):
+            bottleneck = int(
+                self.model_config.model_kwargs.get("camera_encoder_bottleneck", 256)
+            )
+            enc = transformer.attach_camera_encoder(bottleneck=bottleneck)
+            # the transformer's own params were assigned from the checkpoint, so
+            # the freshly-built encoder is still on CPU/float32
+            enc.to(device=self.device_torch, dtype=dtype)
+            enc.zero_init()  # `.to()` preserves zeros, but assert the invariant
+            if not enc.is_zero_initialized():
+                raise ValueError(
+                    "camera encoder is not zero-initialized after attach — it "
+                    "must be an exact no-op at step 0 on this distilled base"
+                )
+            n = sum(p.numel() for p in enc.parameters())
+            self.print_and_status_update(
+                f" - attached camera encoder (bottleneck {bottleneck}, "
+                f"{n / 1e6:.1f}M params, zero-init)"
+            )
         return transformer
 
     def _load_text_encoder(self):
@@ -1243,6 +1268,17 @@ class MinimaxH3Model(BaseModel):
                 # video_indices (reference rows precede target rows)
                 video_rows = torch.cat(ref_rows_list + [video_rows], dim=1)
 
+        # R6b: the trajectory as numbers, added to the TARGET video rows only.
+        # video_indices is condition-first (references precede target rows), so
+        # the target slice starts at num_cond — the same convention the loss
+        # slice below uses. Getting this wrong would write the camera embedding
+        # into the conditioning the model is supposed to read.
+        cam_pose, target_video_indices = None, None
+        if getattr(self.model, "camera_encoder", None) is not None:
+            cam_pose = self._camera_pose_batch(batch, t_lat, device, dtype)
+            if cam_pose is not None:
+                target_video_indices = video_indices[num_cond:].to(device)
+
         video_pred, audio_pred = self.model(
             hidden_states=video_rows,
             audio_hidden_states=audio_rows.to(dtype),
@@ -1253,6 +1289,8 @@ class MinimaxH3Model(BaseModel):
             video_indices=video_indices.to(device),
             audio_indices=audio_indices.to(device),
             text_indices=text_indices.to(device),
+            cam_pose=cam_pose,
+            target_video_indices=target_video_indices,
         )
 
         if batch is not None and batch.audio_target is not None:
@@ -1265,6 +1303,58 @@ class MinimaxH3Model(BaseModel):
         video_pred = video_pred[:, num_cond:]
         noise_pred = unpatchify_video_tokens(video_pred, t_lat, h_lat, w_lat)
         return -noise_pred
+
+    # ------------------------------------------------------------------
+    # R6b camera-pose sidecars
+    # ------------------------------------------------------------------
+
+    def _camera_pose_path(self, target_path: str) -> str:
+        """Name-matched sidecar for one target clip.
+
+        ``model_kwargs.camera_pose_path`` names a directory of ``{stem}.npy``,
+        each holding ``(F, 4, 4)`` camera-to-world for the TARGET camera **in
+        metres**, expressed relative to the source's frame 0 (D2) — the same
+        trajectory the raymap renders, so the two arms condition on identical
+        information through different mechanisms. Defaults to a ``camera_pose``
+        directory beside the targets folder.
+        """
+        override = self.model_config.model_kwargs.get("camera_pose_path", None)
+        stem = os.path.splitext(os.path.basename(target_path))[0]
+        if override:
+            return os.path.join(override, f"{stem}.npy")
+        return os.path.join(
+            os.path.dirname(os.path.dirname(target_path)), "camera_pose",
+            f"{stem}.npy")
+
+    def _camera_pose_batch(self, batch, num_latent_frames, device, dtype):
+        """(B, T_lat, 12) pose vectors for the batch, or None.
+
+        Missing sidecars are FATAL, not skipped. A silently absent pose means
+        the encoder arm trains with no camera conditioning at all and reports a
+        confident FAIL that reads as an architecture verdict — which is exactly
+        the failure that blocked this arm in the first place. The whole point
+        of the encoder arm is the pose; there is no sensible default for it.
+        """
+        import numpy as np
+
+        from .src.camera_encoder import poses_to_latent_vectors
+
+        items = getattr(batch, "file_items", None) if batch is not None else None
+        if not items:
+            return None  # sampling path supplies its pose explicitly
+        vectors = []
+        for item in items:
+            path = self._camera_pose_path(item.path)
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"camera encoder is enabled but its pose sidecar is missing: "
+                    f"{path}. Build it with make_train_assets.py (it writes one "
+                    f"per pair beside the targets); training without it would "
+                    f"condition on nothing and look like an architecture result."
+                )
+            c2w = torch.from_numpy(np.load(path).astype("float32"))
+            vectors.append(poses_to_latent_vectors(c2w, num_latent_frames))
+        return torch.stack(vectors).to(device=device, dtype=dtype)
 
     def get_loss_target(self, *args, **kwargs):
         noise = kwargs.get("noise")

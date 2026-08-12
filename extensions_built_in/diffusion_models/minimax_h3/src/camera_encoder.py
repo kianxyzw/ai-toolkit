@@ -89,6 +89,48 @@ def pose_vectors_from_c2w(c2w: torch.Tensor, check_scale: bool = True) -> torch.
     return c2w[:, :3, :].reshape(c2w.shape[0], POSE_DIM)
 
 
+def latent_frame_indices(num_video_frames: int, num_latent_frames: int) -> list[int]:
+    """Which VIDEO frame represents each LATENT frame.
+
+    The visual VAE is causal and 4x temporal: latent 0 corresponds to video
+    frame 0 alone, and latent k>0 to the group of four frames ending at
+    ``4k``. 73 video frames therefore give 19 latents ((73-1)/4 + 1).
+
+    A representative frame is taken rather than an average because averaging
+    rotation matrices is not a rotation — the mean of two 90-degree-apart
+    orientations is not a valid pose, and it would silently shrink the
+    conditioning signal toward the identity. The group's LAST frame is the
+    temporally aligned choice under a causal VAE.
+
+    Falls back to a uniform spread when the counts do not fit the 4x causal
+    grid, so a different frame count degrades to something sane rather than
+    raising deep inside a training step.
+    """
+    if num_latent_frames <= 0:
+        raise ValueError(f"num_latent_frames must be positive, got {num_latent_frames}")
+    if num_video_frames <= 0:
+        raise ValueError(f"num_video_frames must be positive, got {num_video_frames}")
+    if num_video_frames == (num_latent_frames - 1) * 4 + 1:
+        return [0] + [4 * k for k in range(1, num_latent_frames)]
+    if num_latent_frames == 1:
+        return [0]
+    step = (num_video_frames - 1) / (num_latent_frames - 1)
+    return [min(num_video_frames - 1, int(round(k * step)))
+            for k in range(num_latent_frames)]
+
+
+def poses_to_latent_vectors(c2w: torch.Tensor, num_latent_frames: int,
+                            check_scale: bool = True) -> torch.Tensor:
+    """(F, 4, 4) c2w in metres -> (num_latent_frames, 12) pose vectors.
+
+    The sidecar stores per-VIDEO-frame poses so it is independent of whatever
+    temporal compression the VAE applies; the reduction to latent resolution
+    happens here, once, where the latent frame count is known.
+    """
+    idx = latent_frame_indices(int(c2w.shape[0]), num_latent_frames)
+    return pose_vectors_from_c2w(c2w[idx], check_scale=check_scale)
+
+
 class MiniMaxH3CameraEncoder(nn.Module):
     """Trajectory -> per-block additive embedding for the target video rows.
 

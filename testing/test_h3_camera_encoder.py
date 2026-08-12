@@ -362,6 +362,81 @@ def test_lora_targeting_sweeps_up_the_encoder_unless_it_is_excluded():
         "unchanged by attaching this module")
 
 
+def test_encoder_saves_and_loads_separately_from_the_lora():
+    """Item 5b pinned the LoRA at 416 tensors, all `diffusion_model.` prefixed.
+    The encoder is a SECOND artifact: its own keys, its own file, and a
+    round-trip that does not touch the LoRA's key space."""
+    import io
+
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    enc = model.attach_camera_encoder(bottleneck=16)
+    for h in enc.heads:  # give it something to lose
+        torch.nn.init.normal_(h.weight, std=0.1)
+    sd = enc.state_dict()
+    assert not any(k.startswith("diffusion_model.") for k in sd)
+
+    buf = io.BytesIO()
+    torch.save(sd, buf)
+    buf.seek(0)
+    enc.zero_init()
+    assert enc.is_zero_initialized()
+    enc.load_state_dict(torch.load(buf, weights_only=True))
+    assert not enc.is_zero_initialized(), "round-trip lost the trained heads"
+    for k, v in sd.items():
+        assert torch.equal(enc.state_dict()[k], v), f"{k} did not round-trip"
+
+    # and the two key spaces do not overlap
+    lora_space = {k for k in model.state_dict()
+                  if "adaln_proj" not in k and "camera_encoder" not in k}
+    enc_space = {f"camera_encoder.{k}" for k in sd}
+    assert not (lora_space & enc_space)
+
+
+def test_encoder_works_with_the_raymap_reference_dropped():
+    """The encoder arm's actual configuration: ONE reference stream (source),
+    not two. Its whole premise is that the trajectory arrives as numbers, so
+    the packed sequence it trains on has fewer condition rows than R6a's —
+    and the target-row slice must still be right."""
+    p = pruned_params()
+    torch.manual_seed(5)
+    model = MiniMaxH3Transformer(p).eval()
+    enc = model.attach_camera_encoder(bottleneck=16)
+    for h in enc.heads:
+        torch.nn.init.normal_(h.weight, std=0.5)
+    # one reference stream => one block of condition rows
+    batch, target_idx, n_frames = make_batch(p, num_cond_frames=1, rows_per_frame=4)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+    seen = []
+    handle = model.blocks[0].register_forward_pre_hook(
+        lambda _m, a: seen.append(a[0].detach().clone()))
+    try:
+        with torch.no_grad():
+            model(**batch)
+            model(**batch, cam_pose=pose, target_video_indices=target_idx)
+    finally:
+        handle.remove()
+    delta = (seen[1] - seen[0])[0]
+    touched = set((delta.abs().sum(-1) > 0).nonzero().flatten().tolist())
+    assert touched == set(target_idx.tolist())
+    # the single reference block is still untouched
+    assert not (touched & set(batch["video_indices"][:4].tolist()))
+
+
+def test_latent_reduction_and_pose_helpers():
+    from extensions_built_in.diffusion_models.minimax_h3.src.camera_encoder import (
+        latent_frame_indices, poses_to_latent_vectors)
+    assert latent_frame_indices(73, 19) == [0] + [4 * k for k in range(1, 19)]
+    assert latent_frame_indices(1, 1) == [0]
+    # non-4x counts must degrade, not raise, inside a training step
+    idx = latent_frame_indices(50, 13)
+    assert len(idx) == 13 and idx[0] == 0 and idx[-1] == 49
+    c2w = torch.zeros(73, 4, 4)
+    c2w[:, :3, :3] = torch.eye(3)
+    c2w[:, 0, 3] = torch.linspace(0, 5, 73)
+    assert poses_to_latent_vectors(c2w, 19).shape == (19, POSE_DIM)
+
+
 def test_pose_vectors_layout_matches_recammaster():
     c2w = torch.zeros(2, 4, 4)
     c2w[:, :3, :3] = torch.eye(3)
