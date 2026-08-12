@@ -35,6 +35,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from .camera_encoder import add_camera_embedding
+
 MODALITY_NUM = 3  # 0 = video, 1 = text, 2 = audio; -1 marks padding rows
 
 
@@ -403,7 +405,33 @@ class MiniMaxH3Transformer(nn.Module):
         self.blocks = nn.ModuleList([MiniMaxH3Block(p) for _ in range(p.num_layers)])
         self.final_layer = MiniMaxH3FinalLayer(p)
 
+        # R6b arm, attached only when that arm runs (see attach_camera_encoder).
+        # Left as a plain None rather than an empty module so the default model
+        # has byte-identical state_dict keys and the R6a arm is unaffected.
+        self.camera_encoder = None
+
         self.gradient_checkpointing = False
+
+    def attach_camera_encoder(self, bottleneck: int = 256):
+        """Attach the R6b camera encoder. Zero-init, so this is a no-op at step 0.
+
+        ⚠ The encoder's linears become children of this module, which means
+        ai-toolkit's LoRA targeting would sweep them up: it selects by module
+        CLASS (``LINEAR_MODULES``) under ``target_lora_modules =
+        ["MiniMaxH3Transformer"]``, so every ``nn.Linear`` here is a candidate.
+        The R6b config must therefore carry ``camera_encoder`` in
+        ``network.ignore_if_contains`` alongside ``adaln_proj``. LoRA-ing the
+        encoder would be doubly wrong — it is already fully trainable, and it
+        would inflate the artifact that item 5b pinned at 416 tensors.
+        """
+        from .camera_encoder import MiniMaxH3CameraEncoder
+
+        self.camera_encoder = MiniMaxH3CameraEncoder(
+            hidden_size=self.params.hidden_size,
+            num_layers=self.params.num_layers,
+            bottleneck=bottleneck,
+        )
+        return self.camera_encoder
 
     # float32 islands of the shipped checkpoint; used by the loader to keep
     # these keys at full precision when the rest is cast to bf16
@@ -457,6 +485,11 @@ class MiniMaxH3Transformer(nn.Module):
         video_indices: torch.Tensor,  # (Nv,) long positions of video rows in the pack
         audio_indices: torch.Tensor,  # (Na,) long
         text_indices: torch.Tensor,  # (L,) long
+        # R6b camera-encoder arm (optional; absent = bit-identical to before).
+        # cam_pose is (B, T_latent, 12) target-camera 3x4 c2w in METRES, and
+        # target_video_indices is video_indices[num_condition_video_rows:].
+        cam_pose: Optional[torch.Tensor] = None,
+        target_video_indices: Optional[torch.Tensor] = None,
     ):
         """Returns (video_out (B, Nv, 96), audio_out (B, Na, 32)) — the
         data-ward velocity ``clean - noise`` for every row, in input order.
@@ -498,7 +531,37 @@ class MiniMaxH3Transformer(nn.Module):
         temb = self._time_embedding(unique_t)
         adaln_indices = inverse * MODALITY_NUM + token_tags.clamp(min=0)
 
-        for block in self.blocks:
+        # R6b: one trunk pass for the whole stack; per-block heads are cheap.
+        # Everything here is skipped unless the encoder is attached AND a pose
+        # was supplied, so the default path is untouched.
+        cam_features = None
+        rows_per_frame = 0
+        if (getattr(self, "camera_encoder", None) is not None
+                and cam_pose is not None):
+            if target_video_indices is None:
+                raise ValueError(
+                    "cam_pose given without target_video_indices — the encoder "
+                    "must not guess which rows are the target; reference rows "
+                    "come first in video_indices and writing into them would "
+                    "corrupt the conditioning silently"
+                )
+            cam_features = self.camera_encoder.trunk_features(cam_pose)
+            n_target = int(target_video_indices.shape[0])
+            n_frames = int(cam_features.shape[1])
+            if n_frames == 0 or n_target % n_frames:
+                raise ValueError(
+                    f"{n_target} target video rows do not divide evenly into "
+                    f"{n_frames} pose frames"
+                )
+            rows_per_frame = n_target // n_frames
+
+        for i, block in enumerate(self.blocks):
+            if cam_features is not None:
+                x = add_camera_embedding(
+                    x,
+                    self.camera_encoder.block_delta(i, cam_features, rows_per_frame),
+                    target_video_indices,
+                )
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = checkpoint(
                     block,

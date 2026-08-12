@@ -91,14 +91,23 @@ def _cross_check_real_class():
         from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import (
             COMFY_FILES as real_files, MinimaxH3Model,
         )
-    except Exception as e:
-        print(f"  [--] real-class cross-check SKIPPED ({type(e).__name__}) — "
+    except ImportError as e:
+        # ONLY a missing dependency may skip. A broad `except Exception` here
+        # swallowed an AttributeError from the cross-check's own stub and
+        # printed SKIPPED, so this block reported "fine" in the torch-less env
+        # (where it never ran) and was never run in the env that has torch —
+        # it had never executed successfully anywhere. Same shape as the
+        # "benign by default" stage-policy bug: the default must be loud.
+        print(f"  [--] real-class cross-check SKIPPED (ImportError: {e}) — "
               "source-level logic above still fully exercised")
         return False
     assert real_files == COMFY_FILES, "COMFY_FILES drifted from the parsed copy"
     for partition, (component, want_refs) in PARTITIONS.items():
         m = SimpleNamespace(model_config=SimpleNamespace(
             model_kwargs={"partition": partition}))
+        # is_ref2va calls self._dit_component(); the stub must answer it as a
+        # bound method, not merely have the unbound function available.
+        m._dit_component = lambda _m=m: MinimaxH3Model._dit_component(_m)
         assert MinimaxH3Model._dit_component(m) == component
         assert MinimaxH3Model.is_ref2va.fget(m) is want_refs
     print("  [ok] real MinimaxH3Model agrees on all 4 partitions")

@@ -1,0 +1,398 @@
+"""R6b camera-encoder module — local tests, no weights, no GPU.
+
+The three claims the R6b brief requires before the arm may run, plus the
+guards for the two ways this module can fail silently.
+
+Run:  python testing/test_h3_camera_encoder.py
+"""
+
+import sys
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from extensions_built_in.diffusion_models.minimax_h3.src.camera_encoder import (  # noqa: E402
+    MiniMaxH3CameraEncoder, POSE_DIM, add_camera_embedding,
+    encoder_state_dict_prefix, pose_vectors_from_c2w)
+from extensions_built_in.diffusion_models.minimax_h3.src.transformer import (  # noqa: E402
+    MiniMaxH3Transformer, MiniMaxH3TransformerParams)
+
+PASS, FAIL = [], []
+
+
+def check(name, fn):
+    try:
+        fn()
+        PASS.append(name)
+        print(f"  ok   {name}")
+    except Exception as e:  # noqa: BLE001
+        FAIL.append((name, e))
+        print(f"  FAIL {name}: {e}")
+
+
+def tiny_params(**kw):
+    """A structurally faithful but small H3: same shapes, 2 blocks."""
+    # attention_head_dim must be >= rope's 96 output channels (2 * 3 *
+    # rope_inv_freq_len); 128 is the shipped value, so keep it real.
+    base = dict(hidden_size=64, num_layers=2, num_attention_heads=2,
+                attention_head_dim=128, ffn_hidden_size=128, text_dim=48,
+                time_embed_dim=32, time_embed_hidden_size=64,
+                token_refiner_num_layers=1)
+    base.update(kw)
+    return MiniMaxH3TransformerParams(**base)
+
+
+def pruned_params(**kw):
+    """The PRUNED structure — adaln driven by a t-table, block bias present.
+
+    R6b must resolve against this, not against the BF16 shards: D1 reverted to
+    the pruned repack, and the 2026-08-12 verification found three separate
+    bugs from code that assumed the non-pruned structure.
+    """
+    # adaln_apply_silu is a derived @property (False when a t-table is
+    # present), not a constructor argument — passing it is a TypeError.
+    return tiny_params(adaln_t_table_size=32, adaln_bias_from_checkpoint=True,
+                       **kw)
+
+
+def make_batch(p, num_cond_frames=1, num_target_frames=3, rows_per_frame=4,
+               text_len=5, audio_rows=2, batch=1, seed=0):
+    """A packed sequence with reference video rows FIRST, then target rows."""
+    torch.manual_seed(seed)
+    n_video = (num_cond_frames + num_target_frames) * rows_per_frame
+    seq = text_len + n_video + audio_rows
+    text_indices = torch.arange(text_len)
+    video_indices = torch.arange(text_len, text_len + n_video)
+    audio_indices = torch.arange(text_len + n_video, seq)
+    video_patch_dim = p.latents_dim * p.patch_size[0] * p.patch_size[1] * p.patch_size[2]
+    tags = torch.zeros(batch, seq, dtype=torch.long)
+    tags[:, text_indices] = 1
+    tags[:, audio_indices] = 2
+    return dict(
+        hidden_states=torch.randn(batch, n_video, video_patch_dim),
+        audio_hidden_states=torch.randn(batch, audio_rows, p.audio_latents_dim),
+        encoder_hidden_states=torch.randn(batch, text_len, p.text_dim),
+        row_timesteps=torch.full((batch, seq), 0.5),
+        token_tags=tags,
+        position_ids=torch.zeros(batch, seq, 3),
+        video_indices=video_indices,
+        audio_indices=audio_indices,
+        text_indices=text_indices,
+    ), video_indices[num_cond_frames * rows_per_frame:], num_target_frames
+
+
+# ---------------------------------------------------------------------------
+# 1. zero-init proves a no-op at step 0 — BIT-identical, not "close"
+# ---------------------------------------------------------------------------
+
+def test_zero_init_is_bit_identical_to_no_encoder():
+    p = pruned_params()
+    torch.manual_seed(1)
+    model = MiniMaxH3Transformer(p).eval()
+    batch, target_idx, n_frames = make_batch(p)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+
+    with torch.no_grad():
+        before_v, before_a = model(**batch)
+        model.attach_camera_encoder(bottleneck=16)
+        after_v, after_a = model(**batch, cam_pose=pose,
+                                 target_video_indices=target_idx)
+
+    assert torch.equal(before_v, after_v), "video output changed at step 0"
+    assert torch.equal(before_a, after_a), "audio output changed at step 0"
+
+
+def test_encoder_reports_zero_initialized_and_stops_being_a_no_op_once_trained():
+    """The positive control. A no-op test passes trivially if the module is
+    never wired in — this proves the wiring is live by breaking it."""
+    p = pruned_params()
+    torch.manual_seed(1)
+    model = MiniMaxH3Transformer(p).eval()
+    enc = model.attach_camera_encoder(bottleneck=16)
+    assert enc.is_zero_initialized()
+    batch, target_idx, n_frames = make_batch(p)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+
+    with torch.no_grad():
+        base, _ = model(**batch, cam_pose=pose, target_video_indices=target_idx)
+        for head in enc.heads:  # simulate a training step having happened
+            torch.nn.init.normal_(head.weight, std=0.05)
+        assert not enc.is_zero_initialized()
+        moved, _ = model(**batch, cam_pose=pose, target_video_indices=target_idx)
+
+    assert not torch.equal(base, moved), \
+        "output did not change after training the heads — the encoder is not wired in"
+
+
+def test_gradients_reach_the_encoder():
+    p = pruned_params()
+    torch.manual_seed(1)
+    model = MiniMaxH3Transformer(p)
+    enc = model.attach_camera_encoder(bottleneck=16)
+    batch, target_idx, n_frames = make_batch(p)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+    v, _ = model(**batch, cam_pose=pose, target_video_indices=target_idx)
+    v.sum().backward()
+    assert enc.heads[0].weight.grad is not None
+    assert enc.trunk[0].weight.grad is not None
+    assert enc.trunk[0].weight.grad.abs().sum() == 0, (
+        "trunk received a non-zero gradient through zero-init heads — "
+        "the chain rule says it must be exactly zero on the first step")
+
+
+# ---------------------------------------------------------------------------
+# 2. shapes resolve on the PRUNED structure
+# ---------------------------------------------------------------------------
+
+def test_shapes_resolve_on_the_pruned_structure():
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    enc = model.attach_camera_encoder(bottleneck=16)
+    assert model.time_embedder is None, "control: this is the pruned structure"
+    assert hasattr(model, "adaln_t_table")
+    assert len(enc.heads) == p.num_layers
+    assert enc.heads[0].out_features == p.hidden_size
+    batch, target_idx, n_frames = make_batch(p)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+    v, a = model(**batch, cam_pose=pose, target_video_indices=target_idx)
+    assert v.shape[1] == batch["hidden_states"].shape[1]
+    assert a.shape[1] == batch["audio_hidden_states"].shape[1]
+
+
+def test_shapes_resolve_on_the_non_pruned_structure_too():
+    p = tiny_params()
+    model = MiniMaxH3Transformer(p)
+    model.attach_camera_encoder(bottleneck=16)
+    assert model.time_embedder is not None, "control: non-pruned"
+    batch, target_idx, n_frames = make_batch(p)
+    model(**batch, cam_pose=torch.randn(1, n_frames, POSE_DIM),
+          target_video_indices=target_idx)
+
+
+def test_full_size_head_count_and_parameter_budget():
+    """The bottleneck is the reason this arm is affordable on H3.
+
+    ReCamMaster's per-block ``dim x dim`` projector at H3's 5376/50 would be
+    1.45B parameters. Assert the deviation actually bought what it claims.
+    """
+    p = MiniMaxH3TransformerParams()
+    enc = MiniMaxH3CameraEncoder(p.hidden_size, p.num_layers, bottleneck=256)
+    n = sum(x.numel() for x in enc.parameters())
+    recam_style = p.num_layers * (p.hidden_size * p.hidden_size + p.hidden_size)
+    assert n < recam_style / 10, f"{n/1e6:.1f}M is not << {recam_style/1e6:.0f}M"
+    assert n < 100e6, f"{n/1e6:.1f}M parameters is too large for a side-module"
+
+
+# ---------------------------------------------------------------------------
+# 3. it writes to TARGET video rows only — never refs, adaln, or audio
+# ---------------------------------------------------------------------------
+
+def test_embedding_lands_only_on_target_rows():
+    x = torch.zeros(1, 10, 4)
+    delta = torch.ones(1, 3, 4)
+    idx = torch.tensor([5, 6, 7])
+    out = add_camera_embedding(x, delta, idx)
+    assert torch.equal(out[0, 5:8], torch.ones(3, 4))
+    untouched = torch.cat([out[0, :5], out[0, 8:]])
+    assert torch.equal(untouched, torch.zeros(7, 4)), "wrote outside the target rows"
+
+
+def test_the_write_lands_only_on_target_rows_in_the_real_residual_stream():
+    """The specific corruption this arm could cause: reference rows come FIRST
+    in video_indices, so an off-by-num_cond slice writes the camera embedding
+    into the conditioning the model is supposed to read.
+
+    ⚠ Asserted at the WRITE SITE, on the residual stream entering block 0 —
+    not on the model output. Attention is global, so once the target rows
+    change, every other row's *output* changes too; that is conditioning
+    working as designed. An end-to-end check therefore cannot distinguish
+    "wrote into the reference rows" from "attention propagated", and would
+    fail on correct code (it did, when this test was first written that way).
+    """
+    p = pruned_params()
+    torch.manual_seed(3)
+    model = MiniMaxH3Transformer(p).eval()
+    enc = model.attach_camera_encoder(bottleneck=16)
+    for head in enc.heads:
+        torch.nn.init.normal_(head.weight, std=0.5)
+    n_cond_frames, rows_per_frame = 2, 4
+    batch, target_idx, n_frames = make_batch(
+        p, num_cond_frames=n_cond_frames, rows_per_frame=rows_per_frame)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+
+    seen = []
+    handle = model.blocks[0].register_forward_pre_hook(
+        lambda _m, args: seen.append(args[0].detach().clone()))
+    try:
+        with torch.no_grad():
+            model(**batch)
+            model(**batch, cam_pose=pose, target_video_indices=target_idx)
+    finally:
+        handle.remove()
+
+    base, moved = seen
+    delta = (moved - base)[0]
+    touched = set((delta.abs().sum(-1) > 0).nonzero().flatten().tolist())
+    assert touched == set(target_idx.tolist()), (
+        f"wrote to rows {sorted(touched - set(target_idx.tolist()))} outside the "
+        f"target set; missed {sorted(set(target_idx.tolist()) - touched)}")
+    # and the rows it must never reach, named explicitly
+    for name, idx in (("text", batch["text_indices"]),
+                      ("audio", batch["audio_indices"]),
+                      ("reference video", batch["video_indices"][:n_cond_frames
+                                                                 * rows_per_frame])):
+        assert not (touched & set(idx.tolist())), f"wrote into {name} rows"
+
+
+def test_adaln_parameters_are_untouched():
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    before = {k: v.clone() for k, v in model.state_dict().items() if "adaln" in k}
+    model.attach_camera_encoder(bottleneck=16)
+    after = {k: v for k, v in model.state_dict().items() if "adaln" in k}
+    assert set(before) == set(after), "attaching the encoder changed adaln keys"
+    for k in before:
+        assert torch.equal(before[k], after[k]), f"adaln tensor {k} was modified"
+
+
+def test_missing_target_indices_is_an_error_not_a_guess():
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    model.attach_camera_encoder(bottleneck=16)
+    batch, _, n_frames = make_batch(p)
+    try:
+        model(**batch, cam_pose=torch.randn(1, n_frames, POSE_DIM))
+    except ValueError:
+        return
+    raise AssertionError("guessed the target rows instead of refusing")
+
+
+def test_row_frame_mismatch_is_rejected():
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    model.attach_camera_encoder(bottleneck=16)
+    batch, target_idx, n_frames = make_batch(p)
+    try:
+        model(**batch, cam_pose=torch.randn(1, n_frames + 2, POSE_DIM),
+              target_video_indices=target_idx)
+    except ValueError:
+        return
+    raise AssertionError("accepted a pose sequence that does not divide the rows")
+
+
+def test_frames_expand_frame_major_not_tiled():
+    """repeat_interleave vs repeat. Both give the right SHAPE; only one pairs
+    each frame with its own rows."""
+    enc = MiniMaxH3CameraEncoder(hidden_size=4, num_layers=1, bottleneck=3)
+    torch.nn.init.eye_(enc.heads[0].weight[:3, :3])
+    feats = torch.tensor([[[1.0, 0, 0], [0, 1.0, 0]]])
+    out = enc.block_delta(0, feats, rows_per_frame=2)
+    assert out.shape == (1, 4, 4)
+    assert torch.equal(out[0, 0], out[0, 1]), "rows of frame 0 must share an embedding"
+    assert torch.equal(out[0, 2], out[0, 3]), "rows of frame 1 must share an embedding"
+    assert not torch.equal(out[0, 0], out[0, 2]), "frames must differ (tiled, not interleaved)"
+
+
+# ---------------------------------------------------------------------------
+# 4. LoRA separability + the unit-scale guard
+# ---------------------------------------------------------------------------
+
+def test_encoder_keys_are_explicitly_named_and_not_diffusion_model_prefixed():
+    """Item 5b pinned the LoRA artifact at 416 tensors, ALL ``diffusion_model.``
+    prefixed with zero adaln keys. The encoder must be separable from it."""
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    enc = model.attach_camera_encoder(bottleneck=16)
+    keys = list(enc.state_dict())
+    assert keys, "encoder has no parameters"
+    assert not any(k.startswith("diffusion_model.") for k in keys)
+    assert encoder_state_dict_prefix() == "camera_encoder."
+    in_model = [k for k in model.state_dict() if k.startswith("camera_encoder.")]
+    assert len(in_model) == len(keys), "encoder keys are not under one prefix"
+    # every encoder key is findable by the exclusion substring a config uses
+    assert all("camera_encoder" in k for k in in_model)
+
+
+def test_lora_targeting_sweeps_up_the_encoder_unless_it_is_excluded():
+    """The claim the R6b brief actually makes, measured with upstream's own
+    selection rule rather than by inspecting key names.
+
+    ai-toolkit's LoRA targeting selects by module CLASS under
+    ``target_lora_modules = ["MiniMaxH3Transformer"]``, so every ``nn.Linear``
+    attached under the transformer is a candidate — including the encoder's.
+    Three counts, and the middle one is the positive control: without it,
+    "excluded" could mean "was never a candidate", and the config line would
+    be cargo-cult.
+    """
+    from toolkit.lora_special import LINEAR_MODULES
+
+    def count(root, ignore):
+        n = 0
+        for _, module in root.named_modules():
+            if module.__class__.__name__ != "MiniMaxH3Transformer":
+                continue
+            for child_name, child in module.named_modules():
+                if child.__class__.__name__ not in LINEAR_MODULES:
+                    continue
+                if not any(w in child_name for w in ignore):
+                    n += 1
+        return n
+
+    p = MiniMaxH3TransformerParams()
+    p.adaln_t_table_size = 1000            # the PRUNED structure
+    p.adaln_bias_from_checkpoint = True
+    with torch.device("meta"):
+        model = MiniMaxH3Transformer(p)
+        baseline = count(model, ("adaln_proj",))
+        model.attach_camera_encoder(bottleneck=256)
+        swept = count(model, ("adaln_proj",))
+        excluded = count(model, ("adaln_proj", "camera_encoder"))
+
+    assert swept > baseline, (
+        "control failed: the encoder was never a LoRA candidate, so excluding "
+        "it proves nothing — re-check the targeting rule before trusting this")
+    assert swept - baseline == p.num_layers + 2, (
+        f"expected {p.num_layers} heads + 2 trunk linears to be swept up, "
+        f"got {swept - baseline}")
+    assert excluded == baseline, (
+        f"ignore_if_contains=['adaln_proj','camera_encoder'] left {excluded} "
+        f"targets, want the pre-encoder {baseline} — the LoRA artifact must be "
+        "unchanged by attaching this module")
+
+
+def test_pose_vectors_layout_matches_recammaster():
+    c2w = torch.zeros(2, 4, 4)
+    c2w[:, :3, :3] = torch.eye(3)
+    c2w[0, :3, 3] = torch.tensor([1.0, 2.0, 3.0])
+    c2w[1, :3, 3] = torch.tensor([4.0, 5.0, 6.0])
+    v = pose_vectors_from_c2w(c2w)
+    assert v.shape == (2, POSE_DIM)
+    # row-major 3x4: [R00 R01 R02 t0 | R10 R11 R12 t1 | R20 R21 R22 t2]
+    assert torch.equal(v[0], torch.tensor([1., 0, 0, 1., 0, 1., 0, 2., 0, 0, 1., 3.]))
+
+
+def test_double_centimetre_conversion_is_rejected():
+    """ReCamMaster divides translations by 100; extrinsics.py already did.
+    Re-applying leaves ~1 cm of motion — trains fine, conditions on nothing,
+    and reads as an architecture result. Same shape as the R1 bug."""
+    c2w = torch.zeros(3, 4, 4)
+    c2w[:, :3, :3] = torch.eye(3)
+    c2w[:, 0, 3] = torch.tensor([0.0, 2.5, 5.0])  # metres — fine
+    pose_vectors_from_c2w(c2w)
+    try:
+        pose_vectors_from_c2w(c2w / 100.0)  # the double conversion
+    except ValueError as e:
+        assert "twice" in str(e)
+        return
+    raise AssertionError("accepted double-converted centimetres")
+
+
+if __name__ == "__main__":
+    print("R6b camera encoder")
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            check(name, fn)
+    print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
+    sys.exit(1 if FAIL else 0)
