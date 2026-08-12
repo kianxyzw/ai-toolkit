@@ -1305,8 +1305,53 @@ class MinimaxH3Model(BaseModel):
         return -noise_pred
 
     # ------------------------------------------------------------------
-    # R6b camera-pose sidecars
+    # R6b camera encoder: trainable params + pose sidecars
     # ------------------------------------------------------------------
+
+    def get_additional_training_params(self, lr):
+        """Optimizer param groups for modules that are NOT part of the LoRA.
+
+        ⚠ Without this the camera encoder trains **nothing**.
+        ``BaseSDTrainProcess`` calls ``unet.requires_grad_(False)`` and then
+        optimizes only the LoRA's own parameters — and the encoder is
+        deliberately excluded from LoRA targeting (``ignore_if_contains``), so
+        it would be frozen at its zero-init and the R6b arm would report a
+        confident FAIL while the architecture had never been given a chance.
+        That is the same silent-null shape as ``dit_path``, ``is_ref2va`` and
+        the unconsumed ``camera_encoder`` flag: every layer of the wiring has
+        to be checked separately, because each one fails quietly.
+
+        ReCamMaster trains ``cam_encoder`` + ``projector`` + ``self_attn``;
+        here the attention side is the LoRA's job, so this group is the
+        encoder alone.
+        """
+        enc = getattr(self.model, "camera_encoder", None)
+        if enc is None:
+            return []
+        enc.requires_grad_(True)
+        params = [p for p in enc.parameters() if p.requires_grad]
+        n = sum(p.numel() for p in params)
+        self.print_and_status_update(
+            f" - camera encoder trainable: {len(params)} tensors, "
+            f"{n / 1e6:.1f}M params @ lr {lr}"
+        )
+        return [{"params": params, "lr": lr}]
+
+    def get_additional_save_state_dict(self):
+        """Non-LoRA modules to persist beside the LoRA, keyed by file suffix.
+
+        The camera encoder is excluded from LoRA targeting, so
+        ``network.save_weights`` never sees it — a trained encoder would be
+        thrown away at every checkpoint and the LoRA would depend on weights
+        nobody kept. Written to its own file so the LoRA artifact keeps the
+        exact key set item 5b pinned (416 tensors, all ``diffusion_model.``
+        prefixed, zero adaln keys).
+        """
+        enc = getattr(self.model, "camera_encoder", None)
+        if enc is None:
+            return {}
+        return {"camera_encoder": {f"camera_encoder.{k}": v
+                                   for k, v in enc.state_dict().items()}}
 
     def _camera_pose_path(self, target_path: str) -> str:
         """Name-matched sidecar for one target clip.

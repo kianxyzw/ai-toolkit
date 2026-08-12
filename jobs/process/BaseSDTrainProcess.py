@@ -555,6 +555,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     extra_state_dict=embedding_dict
                 )
                 self.network.multiplier = prev_multiplier
+
+                # Side-modules the model trains OUTSIDE the LoRA (H3's R6b
+                # camera encoder). They are excluded from LoRA targeting on
+                # purpose, which also means network.save_weights never sees
+                # them - so without this a fully trained encoder is discarded
+                # at every checkpoint and the run produces a LoRA that depends
+                # on weights nobody kept. Saved as a SEPARATE file so the LoRA
+                # artifact keeps its exact key set and tensor count.
+                extra_fn = getattr(self.sd, "get_additional_save_state_dict", None)
+                if callable(extra_fn):
+                    for suffix, extra_sd in (extra_fn() or {}).items():
+                        if not extra_sd:
+                            continue
+                        extra_path = os.path.join(
+                            self.save_root, f'{lora_name}{step_num}.{suffix}.safetensors')
+                        save_file(
+                            {k: v.clone().to('cpu', dtype=get_torch_dtype(
+                                self.save_config.dtype))
+                             for k, v in extra_sd.items()},
+                            extra_path, metadata=save_meta)
+                        print(f" - saved {suffix}: {len(extra_sd)} tensors -> "
+                              f"{os.path.basename(extra_path)}")
                 # if we have an embedding as well, pair it with the network
 
             # even if added to lora, still save the trigger version

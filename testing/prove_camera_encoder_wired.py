@@ -182,6 +182,75 @@ def test_double_centimetre_pose_is_rejected_at_the_reduction():
     raise AssertionError("accepted a double-converted (centimetre) trajectory")
 
 
+def test_the_encoder_is_actually_in_the_optimizer():
+    """The layer that fails most quietly of all.
+
+    BaseSDTrainProcess calls ``unet.requires_grad_(False)`` and optimizes only
+    the LoRA's parameters. The encoder is deliberately excluded from LoRA
+    targeting, so without a dedicated param group it stays frozen at zero-init
+    — the loss still falls (on the LoRA), the run still succeeds, and the arm
+    reports FAIL for an architecture that was never trained.
+    """
+    src = (ROOT / "extensions_built_in" / "diffusion_models" / "minimax_h3"
+           / "minimax_h3.py").read_text(encoding="utf-8", errors="replace")
+    assert "def get_additional_training_params" in src, \
+        "the model contributes no optimizer group for the camera encoder"
+    assert "requires_grad_(True)" in src, \
+        "the encoder is never un-frozen after unet.requires_grad_(False)"
+    trainer = (ROOT / "extensions_built_in" / "sd_trainer"
+               / "SDTrainer.py").read_text(encoding="utf-8", errors="replace")
+    assert "get_additional_training_params" in trainer, \
+        "SDTrainer never asks the model for extra trainable modules"
+    assert "def load_additional_training_modules" in trainer, \
+        "SDTrainer does not override the hook the base class provides"
+
+    # behaviour: an optimizer step over that group must move the heads off zero
+    p = pruned_params()
+    torch.manual_seed(7)
+    model = MiniMaxH3Transformer(p)
+    enc = model.attach_camera_encoder(bottleneck=16)
+    enc.requires_grad_(True)
+    assert enc.is_zero_initialized()
+    kw, tgt, nf, _ = make_batch(p)
+    opt = torch.optim.SGD([q for q in enc.parameters() if q.requires_grad], lr=0.1)
+    v, _ = model(**kw, cam_pose=torch.randn(1, nf, POSE_DIM),
+                 target_video_indices=tgt)
+    v.sum().backward()
+    grads = [q.grad for q in enc.heads[0].parameters() if q.grad is not None]
+    assert grads and any(float(g.abs().sum()) > 0 for g in grads), \
+        "no gradient reached the encoder heads"
+    opt.step()
+    assert not enc.is_zero_initialized(), \
+        "an optimizer step did not move the encoder off zero-init"
+
+
+def test_the_trained_encoder_is_actually_saved():
+    """A trained encoder that is not persisted is a discarded experiment.
+
+    It is excluded from LoRA targeting, so network.save_weights never sees it;
+    without a dedicated save path every checkpoint would drop it and the LoRA
+    would depend on weights nobody kept.
+    """
+    src = (ROOT / "extensions_built_in" / "diffusion_models" / "minimax_h3"
+           / "minimax_h3.py").read_text(encoding="utf-8", errors="replace")
+    assert "def get_additional_save_state_dict" in src,         "the model exposes no save path for the camera encoder"
+    base = (ROOT / "jobs" / "process"
+            / "BaseSDTrainProcess.py").read_text(encoding="utf-8", errors="replace")
+    assert "get_additional_save_state_dict" in base,         "the save loop never asks the model for side-module weights"
+    # keys are namespaced and stay out of the LoRA's key space
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    model.attach_camera_encoder(bottleneck=16)
+    import types
+    fake = types.SimpleNamespace(model=model)
+    from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import (
+        MinimaxH3Model)
+    sd = MinimaxH3Model.get_additional_save_state_dict(fake)
+    assert "camera_encoder" in sd and sd["camera_encoder"], "nothing to save"
+    assert all(k.startswith("camera_encoder.") for k in sd["camera_encoder"])
+    assert not any(k.startswith("diffusion_model.") for k in sd["camera_encoder"])
+
+
 def test_the_loader_consumes_the_flag_and_feeds_the_pose():
     """Source-level companion to the behaviour tests above: the forward wiring
     can be perfect while nothing ever turns it on for a real run."""

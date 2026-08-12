@@ -50,6 +50,23 @@ adapter_transforms = transforms.Compose([
 
 class SDTrainer(BaseSDTrainProcess):
 
+    def load_additional_training_modules(self, params):
+        """Let the model contribute optimizer groups outside the LoRA.
+
+        BaseSDTrainProcess freezes the unet and optimizes only the network's
+        own parameters, so any side-module a model attaches (H3's R6b camera
+        encoder) would sit frozen at its initialization and train nothing —
+        silently, since the loss still falls on the LoRA. Models opt in by
+        implementing ``get_additional_training_params(lr)``; everything else
+        is unaffected.
+        """
+        extra_fn = getattr(self.sd, "get_additional_training_params", None)
+        if callable(extra_fn):
+            extra = extra_fn(self.train_config.lr) or []
+            if extra:
+                params = list(params) + list(extra)
+        return params
+
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
         self.assistant_adapter: Union['T2IAdapter', 'ControlNetModel', None]
