@@ -66,6 +66,7 @@ from .src.audio_vae import MiniMaxH3AudioVAE, fold_audio_vae_weight_norm
 from .src.packing import (
     KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG_T,
+    assert_reference_rows,
     build_packed_sequence,
     pack_audio_latents,
     pad_layouts_to_batch,
@@ -1238,6 +1239,13 @@ class MinimaxH3Model(BaseModel):
             ) = pad_layouts_to_batch(layouts)
             num_cond = layouts[0].num_condition_video_rows
 
+            # R6a: measure, do not infer, that the references reached the pack.
+            # Runs on every step (it is arithmetic on shapes) and aborts the
+            # run at step 0 when the reference path has gone silent.
+            self._check_reference_rows(
+                batch, ref_blocks, ref_rows_list, num_cond, cond_rows
+            )
+
             # per-row timesteps: text/video rows at t_v, audio rows at t_a,
             # condition rows pinned at max(t_v, 0.999)
             row_t = t_v.view(-1, 1).expand(-1, token_tags.shape[1]).clone()
@@ -1303,6 +1311,69 @@ class MinimaxH3Model(BaseModel):
         video_pred = video_pred[:, num_cond:]
         noise_pred = unpatchify_video_tokens(video_pred, t_lat, h_lat, w_lat)
         return -noise_pred
+
+    # ------------------------------------------------------------------
+    # R6a reference-presence assertion
+    # ------------------------------------------------------------------
+
+    # one positive report per process; the check itself runs every step
+    _ref_assert_reported = False
+
+    @staticmethod
+    def _reference_dropout_configured(dataset_config) -> bool:
+        """True when per-stream reference dropout (R5c) could legitimately
+        remove a reference from an individual draw."""
+
+        def nonzero(value) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, (list, tuple)):
+                return any(float(v) > 0.0 for v in value)
+            try:
+                return float(value) > 0.0
+            except (TypeError, ValueError):
+                return False
+
+        return nonzero(
+            getattr(dataset_config, "reference_dropout", 0.0)
+        ) or nonzero(getattr(dataset_config, "reference_dropout_end", None))
+
+    def _check_reference_rows(
+        self, batch, ref_blocks, ref_rows_list, num_cond, cond_rows
+    ):
+        """Abort the run if the packed sequence lost its reference conditioning.
+
+        Presence is *measured* here — from the blocks that were built and the
+        rows the layout reserved — rather than inferred from a plausible loss.
+        The R6 hardware check passed R6a on inference of exactly this kind
+        (2026-08-12), and this is the gap it left open.
+
+        Sampling calls arrive with ``batch=None`` and are skipped: the
+        preview/pipeline path builds its own references and has no dataset
+        config to state an expectation.
+        """
+        if batch is None:
+            return
+        dcfg = getattr(batch, "dataset_config", None)
+        declared = getattr(dcfg, "reference_path", None) if dcfg is not None else None
+        if isinstance(declared, str):
+            declared = [declared]
+        summary = assert_reference_rows(
+            declared_streams=len(declared) if declared else 0,
+            ref_blocks=tuple(ref_blocks),
+            ref_row_counts=[int(r.shape[1]) for r in ref_rows_list],
+            num_condition_video_rows=int(num_cond),
+            extra_condition_rows=(
+                int(cond_rows.shape[1]) if cond_rows is not None else 0
+            ),
+            dropout_configured=self._reference_dropout_configured(dcfg),
+        )
+        if not MinimaxH3Model._ref_assert_reported:
+            MinimaxH3Model._ref_assert_reported = True
+            # printed, not just returned: the training log is the artifact a
+            # later session reads, and a check nobody can see in the log is
+            # indistinguishable from a check that never ran
+            print(f" - [ref-assert] {summary}", flush=True)
 
     # ------------------------------------------------------------------
     # R6b camera encoder: trainable params + pose sidecars

@@ -467,6 +467,91 @@ def build_packed_sequence(
     )
 
 
+class ReferenceRowsMissing(RuntimeError):
+    """The packed sequence does not carry the references the dataset declared.
+
+    Its own class so a caller can distinguish "the references never arrived"
+    from every other RuntimeError a training step can raise.
+    """
+
+
+def assert_reference_rows(
+    declared_streams: int,
+    ref_blocks: Tuple[dict, ...],
+    ref_row_counts: List[int],
+    num_condition_video_rows: int,
+    extra_condition_rows: int = 0,
+    dropout_configured: bool = False,
+) -> str:
+    """Positively measure that reference conditioning reached the pack.
+
+    The failure this exists to catch is silent: a run whose references were
+    dropped somewhere between the config and the forward trains happily,
+    reports a normal falling loss and saves a checkpoint — it is simply not
+    the experiment anyone asked for. Four instances of that shape have already
+    cost this project pods (``dit_path`` ignored, ``is_ref2va`` silently false,
+    an unconsumed ``camera_encoder`` flag, an encoder frozen and discarded), so
+    the reference path gets a check that reads the packed sequence rather than
+    inferring presence from a plausible loss.
+
+    Three separate claims, each checked on its own:
+
+    1. **Presence** — the dataset declared N reference streams, so N reference
+       blocks must have been built. With per-stream dropout configured
+       (R5c) fewer is legitimate, but zero never is.
+    2. **Non-emptiness** — the blocks contributed rows. A block describing a
+       zero-row canvas is presence without conditioning.
+    3. **Alignment** — the rows the caller concatenated onto ``hidden_states``
+       equal the condition rows the layout reserved. If these disagree the
+       model still runs, and every row it reads is the wrong one.
+
+    Returns a one-line greppable summary for the training log; raises
+    :class:`ReferenceRowsMissing` otherwise.
+    """
+    n_blocks = len(ref_blocks)
+    rows_from_caller = int(sum(ref_row_counts))
+    expected_cond = rows_from_caller + int(extra_condition_rows)
+
+    if declared_streams > 0:
+        if n_blocks == 0:
+            raise ReferenceRowsMissing(
+                f"reference conditioning DECLARED ({declared_streams} stream(s) "
+                "in dataset reference_path) but the packed sequence carries "
+                "ZERO reference blocks. The references never reached the "
+                "forward — check the dataloader's reference branch, the "
+                "latent cache, and model_kwargs.partition. Training now would "
+                "silently produce an unconditioned run."
+            )
+        if not dropout_configured and n_blocks != declared_streams:
+            raise ReferenceRowsMissing(
+                f"reference count mismatch: dataset declared {declared_streams} "
+                f"stream(s) and the pack carries {n_blocks} block(s), with no "
+                "reference_dropout configured to explain the difference."
+            )
+
+    if n_blocks and rows_from_caller <= 0:
+        raise ReferenceRowsMissing(
+            f"{n_blocks} reference block(s) present but they contribute 0 rows "
+            "to hidden_states — the references are empty."
+        )
+
+    if int(num_condition_video_rows) != expected_cond:
+        raise ReferenceRowsMissing(
+            "packed condition rows do not match the rows supplied: layout "
+            f"reserved {int(num_condition_video_rows)}, caller concatenated "
+            f"{expected_cond} ({rows_from_caller} reference + "
+            f"{int(extra_condition_rows)} keyframe). Every conditioning row "
+            "the model reads would be misaligned."
+        )
+
+    return (
+        f"REF_ASSERT_OK declared_streams={declared_streams} blocks={n_blocks} "
+        f"packed_reference_rows={rows_from_caller} "
+        f"condition_rows={int(num_condition_video_rows)} "
+        f"dropout_configured={bool(dropout_configured)}"
+    )
+
+
 def build_row_timesteps(
     layout: PackedLayout,
     video_timestep: float,
