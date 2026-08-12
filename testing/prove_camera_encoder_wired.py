@@ -251,6 +251,112 @@ def test_the_trained_encoder_is_actually_saved():
     assert not any(k.startswith("diffusion_model.") for k in sd["camera_encoder"])
 
 
+class _StubModel:
+    """Just enough of MinimaxH3Model for the pipeline's denoise loop.
+
+    The pipeline is the only place a trained encoder can be *used*, and it is
+    reachable without a 33B checkpoint: it needs a transformer, a VAE encode /
+    decode, and dtype/device. Everything here is deliberately tiny.
+    """
+
+    def __init__(self, transformer, latent_shape):
+        self.transformer = transformer
+        self.model = transformer
+        self.device_torch = torch.device("cpu")
+        self.torch_dtype = torch.float32
+        self._latent_shape = latent_shape
+
+    def encode_images(self, images):  # references, unused by this arm
+        return torch.zeros((1, 24, 1, 4, 4))
+
+    def decode_latents(self, latents):
+        # (1, 24, t, h, w) -> a picture whose pixels depend on the latents, so
+        # "the output changed" is a real statement about the denoise loop
+        t = latents.shape[2]
+        return latents.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1, 1).clamp(
+            -1, 1)[:, :, :t]
+
+
+def _pipeline_video(transformer, cam_pose, t_lat=2, h_lat=4, w_lat=4, seed=3):
+    from extensions_built_in.diffusion_models.minimax_h3.src.pipeline import (
+        MiniMaxH3Pipeline)
+    from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
+
+    tags = torch.ones(6, dtype=torch.long)
+    embeds = AdvancedPromptEmbeds(
+        text_embeds=[torch.zeros(6, transformer.params.text_dim)],
+        text_token_tags=[tags])
+    embeds.frozen_dtype_keys = ["text_token_tags"]
+    pipe = MiniMaxH3Pipeline(_StubModel(transformer, (1, 24, t_lat, h_lat, w_lat)))
+    num_frames = 5 if t_lat == 2 else 1  # 17n+5 <-> 5n+2
+    return pipe(conditional_embeds=embeds, height=h_lat * 16, width=w_lat * 16,
+                num_frames=num_frames, num_inference_steps=2,
+                generator=torch.Generator(device="cpu").manual_seed(seed),
+                cam_pose=cam_pose, with_audio=False)
+
+
+def test_generation_reads_the_camera_command():
+    """🔴 THE FIFTH LINK. Training had four (config -> loader, loader ->
+    forward, model -> optimizer, trained -> saved). A trained encoder that is
+    never fed at SAMPLING time is a fifth, and it fails the same silent way:
+    every recombination cell comes out identical whatever camera was
+    commanded, which reads exactly like "the encoder does not bind" — a
+    confident FAIL on an architecture that was never asked the question.
+    """
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p).float().eval()
+    model.attach_camera_encoder(bottleneck=8)
+    for head in model.camera_encoder.heads:
+        torch.nn.init.normal_(head.weight, std=0.5)  # undo zero-init
+
+    t_lat = 2
+    pose_a = torch.zeros(t_lat, POSE_DIM)
+    pose_a[:, [0, 4, 8]] = 1.0  # identity rotation, no translation
+    pose_b = pose_a.clone()
+    pose_b[:, [3, 7, 11]] = torch.tensor([2.0, -1.0, 3.0])  # a different camera
+
+    out_a = _pipeline_video(model, pose_a)
+    out_b = _pipeline_video(model, pose_b)
+    va = out_a["video"].float() if isinstance(out_a, dict) else out_a[0]
+    vb = out_b["video"].float() if isinstance(out_b, dict) else out_b[0]
+    delta = float((va - vb).abs().mean())
+    assert delta > 0, (
+        "two different cam_pose values produced a bit-identical generation — "
+        "the pipeline is not feeding the encoder")
+
+
+def test_generation_without_a_pose_is_an_error_not_a_blind_render():
+    """An attached encoder plus no cam_pose must raise. The tempting default
+    (pass None, let the transformer skip the embedding) renders a plausible
+    camera-blind clip, and a plausible clip that answers nothing is the most
+    expensive failure mode this project has."""
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p).float().eval()
+    model.attach_camera_encoder(bottleneck=8)
+    try:
+        _pipeline_video(model, None)
+    except ValueError as e:
+        assert "cam_pose" in str(e)
+        return
+    raise AssertionError("generation with an attached encoder and no cam_pose "
+                         "did not raise")
+
+
+def test_a_pose_without_an_encoder_is_also_an_error():
+    """The mirror case: a recombination run that loads the reference arm's
+    checkpoint but still passes poses would silently discard them."""
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p).float().eval()
+    pose = torch.zeros(2, POSE_DIM)
+    pose[:, [0, 4, 8]] = 1.0
+    try:
+        _pipeline_video(model, pose)
+    except ValueError as e:
+        assert "no camera encoder" in str(e)
+        return
+    raise AssertionError("cam_pose without an encoder did not raise")
+
+
 def test_the_loader_consumes_the_flag_and_feeds_the_pose():
     """Source-level companion to the behaviour tests above: the forward wiring
     can be perfect while nothing ever turns it on for a real run."""

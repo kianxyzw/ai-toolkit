@@ -76,6 +76,10 @@ class MiniMaxH3Pipeline:
             Image.Image
         ] = None,  # first-frame keyframe, already canvas-sized
         ref_videos: Optional[list] = None,  # ref2va: (T, C, H, W) [0, 1] tensors
+        # R6b: (T_latent, 12) or (1, T_latent, 12) target-camera 3x4 c2w rows in
+        # METRES, source-frame-0 anchored — the same vectors the training path
+        # builds from the pose sidecars.
+        cam_pose: Optional[torch.Tensor] = None,
         with_audio: bool = True,
         **kwargs,
     ):
@@ -184,6 +188,39 @@ class MiniMaxH3Pipeline:
         audio_indices = layout.audio_indices.to(device)
         text_indices = layout.text_indices.to(device)
 
+        # --- R6b camera encoder at GENERATION time --------------------------
+        # The fifth wiring link. Training had four (config -> loader, loader ->
+        # forward, model -> optimizer, trained -> saved); a trained encoder that
+        # is never fed at sampling time is a fifth, and it fails the same silent
+        # way: every generated clip comes out identical whatever camera was
+        # commanded, which reads exactly like "the encoder architecture does not
+        # bind". Both directions are errors, never warnings.
+        target_video_indices = None
+        has_encoder = getattr(transformer, "camera_encoder", None) is not None
+        if has_encoder and cam_pose is None:
+            raise ValueError(
+                "a camera encoder is attached but no cam_pose was passed to the "
+                "pipeline: generation would ignore the camera command entirely "
+                "and every sample would be identical. Pass cam_pose=(T_latent, "
+                "12) c2w rows in metres, or load the model without "
+                "model_kwargs.camera_encoder."
+            )
+        if cam_pose is not None:
+            if not has_encoder:
+                raise ValueError(
+                    "cam_pose was passed but no camera encoder is attached — "
+                    "the trajectory would be silently discarded."
+                )
+            cam_pose = cam_pose.to(device, dtype)
+            if cam_pose.dim() == 2:
+                cam_pose = cam_pose[None]
+            if cam_pose.shape[1] != t_lat:
+                raise ValueError(
+                    f"cam_pose has {cam_pose.shape[1]} latent frames, the "
+                    f"generation has {t_lat}"
+                )
+            target_video_indices = video_indices[num_cond:]
+
         # --- denoise loop --------------------------------------------------
         num_steps = sigmas_v.shape[0] - 1
         for i in range(num_steps):
@@ -210,6 +247,8 @@ class MiniMaxH3Pipeline:
                 video_indices=video_indices,
                 audio_indices=audio_indices,
                 text_indices=text_indices,
+                cam_pose=cam_pose,
+                target_video_indices=target_video_indices,
             )
             v_video = video_pred[:, num_cond:].float()
             v_audio = audio_pred.float()

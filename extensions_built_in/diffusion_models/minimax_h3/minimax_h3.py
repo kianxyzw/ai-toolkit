@@ -1472,6 +1472,26 @@ class MinimaxH3Model(BaseModel):
             vectors.append(poses_to_latent_vectors(c2w, num_latent_frames))
         return torch.stack(vectors).to(device=device, dtype=dtype)
 
+    def _camera_pose_from_file(self, path, num_latent_frames):
+        """(T_lat, 12) pose vectors from one sidecar, for the sampling path.
+
+        Same reduction the training path uses, so a preview or a recombination
+        cell conditions on exactly the vectors training saw for that pair.
+        """
+        import numpy as np
+
+        from .src.camera_encoder import poses_to_latent_vectors
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"camera pose sidecar not found: {path}. Sampling with the "
+                "encoder attached and no pose would render a camera-blind clip."
+            )
+        c2w = torch.from_numpy(np.load(path).astype("float32"))
+        return poses_to_latent_vectors(c2w, num_latent_frames).to(
+            device=self.device_torch, dtype=self.torch_dtype
+        )
+
     def get_loss_target(self, *args, **kwargs):
         noise = kwargs.get("noise")
         batch = kwargs.get("batch")
@@ -1583,6 +1603,26 @@ class MinimaxH3Model(BaseModel):
 
         with_audio = bool(self.model_config.model_kwargs.get("sample_audio", True))
 
+        # R6b previews: the encoder is attached for the whole run, so a preview
+        # that passes no cam_pose either raises (pipeline guard) or — worse, if
+        # that guard is ever relaxed — renders a camera-blind sample that looks
+        # like a result. model_kwargs.sample_camera_pose names a pose sidecar,
+        # the same (frames, 4, 4) c2w-in-metres file the dataloader reads.
+        cam_pose = None
+        if getattr(self.model, "camera_encoder", None) is not None:
+            pose_path = self.model_config.model_kwargs.get("sample_camera_pose")
+            if not pose_path:
+                raise ValueError(
+                    "the camera encoder is attached but model_kwargs."
+                    "sample_camera_pose is unset — the preview would have no "
+                    "camera command at all"
+                )
+            cam_pose = self._camera_pose_from_file(
+                pose_path,
+                packing.video_latent_num_frames(gen_config.num_frames)
+                if is_video else 1,
+            )
+
         result = pipeline(
             conditional_embeds=conditional_embeds,
             unconditional_embeds=unconditional_embeds,
@@ -1595,6 +1635,7 @@ class MinimaxH3Model(BaseModel):
             generator=generator,
             ctrl_img=ctrl_img,
             ref_videos=ref_videos,
+            cam_pose=cam_pose,
             with_audio=with_audio and is_video,
         )
         if is_video:
