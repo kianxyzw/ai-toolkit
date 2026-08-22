@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import MinimaxH3Model
 from extensions_built_in.diffusion_models.minimax_h3.src.packing import (
+    ReferenceRowsForbidden,
     ReferenceRowsMissing,
     assert_reference_rows,
     audio_latent_num_frames,
@@ -54,17 +55,22 @@ def check(name, ok, detail=""):
         FAILURES.append(name)
 
 
-def raises(name, fn, fragment=""):
+def raises(name, fn, fragment="", cls=ReferenceRowsMissing):
     try:
         fn()
-    except ReferenceRowsMissing as e:
+    except cls as e:
+        # exact class for the inverted polarity: a ReferenceRowsMissing where
+        # ReferenceRowsForbidden was expected is the WRONG abort, not an abort
+        if cls is not ReferenceRowsMissing and type(e) is not cls:
+            check(name, False, f"raised {type(e).__name__}, wanted {cls.__name__}")
+            return
         check(name, fragment.lower() in str(e).lower(),
               f"message did not mention {fragment!r}: {e}")
         return
     except Exception as e:  # noqa: BLE001
         check(name, False, f"wrong exception type {type(e).__name__}: {e}")
         return
-    check(name, False, "no ReferenceRowsMissing raised")
+    check(name, False, f"no {cls.__name__} raised")
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +148,65 @@ def test_pure():
 # ---------------------------------------------------------------------------
 
 
-def make_model(partition="ref2va"):
+# ---------------------------------------------------------------------------
+# 1b. the INVERTED polarity (R6c-E, amendment_r6ce A-2, 2026-08-22)
+# ---------------------------------------------------------------------------
+
+
+def test_pure_inverted():
+    print("\npure check, forbid_references=True (R6c-E A-2)")
+
+    # the R6c-E shape: nothing declared, nothing packed -> OK, and the summary
+    # says so in the two tokens the orchestrator greps for at pricing
+    summary = assert_reference_rows(
+        declared_streams=0, ref_blocks=(), ref_row_counts=[],
+        num_condition_video_rows=0, forbid_references=True)
+    check("zero references under forbid -> OK", "REF_ASSERT_OK" in summary, summary)
+    check("summary reports packed_reference_rows=0 forbid_references=True",
+          "packed_reference_rows=0" in summary and "forbid_references=True" in summary,
+          summary)
+
+    # ⚠ THE CASE THIS EXISTS FOR: the R6c batch (one raymap stream, packed)
+    # handed to the R6c-E assertion must ABORT with the forbidden class
+    raises("WRONG-MODE COPY: the R6c batch under the R6c-E assertion aborts",
+           lambda: assert_reference_rows(
+               declared_streams=1, ref_blocks=(VIDEO_BLOCK,), ref_row_counts=[40],
+               num_condition_video_rows=40, forbid_references=True),
+           "FORBIDDEN", cls=ReferenceRowsForbidden)
+    raises("a stray packed block with nothing declared still aborts",
+           lambda: assert_reference_rows(
+               declared_streams=0, ref_blocks=(VIDEO_BLOCK,), ref_row_counts=[40],
+               num_condition_video_rows=40, forbid_references=True),
+           "stray reference", cls=ReferenceRowsForbidden)
+    raises("a declared stream with nothing packed still aborts (config, not batch)",
+           lambda: assert_reference_rows(
+               declared_streams=1, ref_blocks=(), ref_row_counts=[],
+               num_condition_video_rows=0, forbid_references=True),
+           "declares 1", cls=ReferenceRowsForbidden)
+    # the mirror: the R6c-E batch (no references) handed to the R6c assertion
+    # (one declared stream) aborts the OTHER way - both polarities fail on the
+    # wrong-mode copy, neither is "reject every reference-free forward"
+    raises("WRONG-MODE COPY: the R6c-E batch under the R6c assertion aborts",
+           lambda: assert_reference_rows(
+               declared_streams=1, ref_blocks=(), ref_row_counts=[],
+               num_condition_video_rows=0, forbid_references=False),
+           "ZERO reference blocks")
+    # keyframe (i2v) rows are not references: a forbid-mode i2v run may keep them
+    summary = assert_reference_rows(
+        declared_streams=0, ref_blocks=(), ref_row_counts=[],
+        num_condition_video_rows=20, extra_condition_rows=20,
+        forbid_references=True)
+    check("keyframe rows are not references under forbid", "blocks=0" in summary,
+          summary)
+    # and the default polarity is unchanged: forbid is opt-in
+    summary = assert_reference_rows(
+        declared_streams=2, ref_blocks=(VIDEO_BLOCK, VIDEO_BLOCK),
+        ref_row_counts=[40, 40], num_condition_video_rows=80)
+    check("default polarity unchanged (forbid_references=False in the summary)",
+          "forbid_references=False" in summary, summary)
+
+
+def make_model(partition="ref2va", model_kwargs=None):
     torch.manual_seed(7)
     params = MiniMaxH3TransformerParams(
         hidden_size=128,
@@ -160,7 +224,7 @@ def make_model(partition="ref2va"):
         model_config=ModelConfig(
             name_or_path="dummy",
             arch="minimax_h3",
-            model_kwargs={"partition": partition},
+            model_kwargs={"partition": partition, **(model_kwargs or {})},
             dtype="float32",
         ),
         dtype="float32",
@@ -262,9 +326,63 @@ def test_forward():
           bool(torch.isfinite(pred).all()))
 
 
+def test_forward_inverted():
+    """The call site under model_kwargs.require_zero_references (R6c-E)."""
+    print("\ncall site, require_zero_references=True (real CPU forward)")
+    torch.manual_seed(0)
+    num_frames = 5
+    latent = torch.randn(1, 24, 2, 8, 10)
+    timestep = torch.tensor([500.0])
+    MinimaxH3Model._ref_assert_reported = False
+
+    model = make_model("ref2va", {"require_zero_references": True})
+    embeds = make_embeds()
+    one_ref = [torch.randn(1, 24, 2, 8, 10)]
+
+    # the R6c-E batch: nothing declared, nothing packed -> trains
+    batch = make_batch(num_frames, refs=None, kinds=None, reference_path=None)
+    pred = model.get_noise_prediction(latent, timestep, embeds, batch=batch)
+    check("R6c-E batch (no references) trains under the inverted assertion",
+          bool(torch.isfinite(pred).all()))
+
+    # ⚠ WRONG-MODE COPY: the R6c batch (declared + packed raymap) under the
+    # R6c-E model must ABORT with the forbidden class
+    batch = make_batch(num_frames, refs=one_ref, kinds=["video"],
+                       reference_path=["/data/raymap_ref"])
+    raises("R6c batch under the R6c-E call site ABORTS",
+           lambda: model.get_noise_prediction(
+               latent, timestep, embeds, batch=batch),
+           "FORBIDDEN", cls=ReferenceRowsForbidden)
+
+    # a reference that arrived with NO declaration (a dataloader surprise)
+    # aborts too: the batch, not the config, is what the pack reads
+    batch = make_batch(num_frames, refs=one_ref, kinds=["video"], reference_path=None)
+    raises("undeclared stray reference under the R6c-E call site ABORTS",
+           lambda: model.get_noise_prediction(
+               latent, timestep, embeds, batch=batch),
+           "stray reference", cls=ReferenceRowsForbidden)
+
+    # and the mirror wrong-mode copy: the R6c-E batch under the R6c model
+    # (one declared stream) aborts the original way
+    r6c_model = make_model("ref2va")
+    batch = make_batch(num_frames, refs=None, kinds=None,
+                       reference_path=["/data/raymap_ref"])
+    raises("R6c-E batch under the R6c call site ABORTS (declared, none packed)",
+           lambda: r6c_model.get_noise_prediction(
+               latent, timestep, embeds, batch=batch),
+           "ZERO reference blocks")
+
+    # sampling still skips: the pipeline supplies its own inputs
+    pred = model.get_noise_prediction(latent, timestep, embeds, batch=None)
+    check("batch=None (sampling) skips the inverted check too",
+          bool(torch.isfinite(pred).all()))
+
+
 def main():
     test_pure()
+    test_pure_inverted()
     test_forward()
+    test_forward_inverted()
     print()
     if FAILURES:
         print(f"TEST FAIL - {len(FAILURES)} failure(s): {FAILURES}")

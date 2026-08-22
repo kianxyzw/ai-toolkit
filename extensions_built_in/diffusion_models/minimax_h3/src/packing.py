@@ -475,6 +475,21 @@ class ReferenceRowsMissing(RuntimeError):
     """
 
 
+class ReferenceRowsForbidden(ReferenceRowsMissing):
+    """The packed sequence carries references in a mode that forbids them.
+
+    R6c-E (amendment_r6ce A-2, 2026-08-22): the command channel is the camera
+    encoder and NO reference stream may exist — a stray reference reintroduces
+    the copyable channel that R6c showed the pretrained ref2va prior reproduces
+    into the output. So the reference-presence assertion INVERTS for that
+    mode: zero packed reference rows is correct, nonzero is the defect.
+
+    Subclasses :class:`ReferenceRowsMissing` so the single ``except`` sites
+    that abort a run on a reference-row defect catch both polarities; the
+    class name is what the log and the judging session read.
+    """
+
+
 def assert_reference_rows(
     declared_streams: int,
     ref_blocks: Tuple[dict, ...],
@@ -482,8 +497,10 @@ def assert_reference_rows(
     num_condition_video_rows: int,
     extra_condition_rows: int = 0,
     dropout_configured: bool = False,
+    forbid_references: bool = False,
 ) -> str:
-    """Positively measure that reference conditioning reached the pack.
+    """Positively measure that reference conditioning reached the pack — or,
+    in a mode that forbids references, positively measure that NONE did.
 
     The failure this exists to catch is silent: a run whose references were
     dropped somewhere between the config and the forward trains happily,
@@ -505,12 +522,36 @@ def assert_reference_rows(
        equal the condition rows the layout reserved. If these disagree the
        model still runs, and every row it reads is the wrong one.
 
+    ``forbid_references`` is the MODE-AWARE inversion (R6c-E, A-2): when
+    set, a declared stream, a packed reference block, or a nonzero reference
+    row count is the defect, and :class:`ReferenceRowsForbidden` is raised.
+    Both polarities are tested against wrong-mode batches in
+    ``testing/test_h3_reference_assert.py``.
+
     Returns a one-line greppable summary for the training log; raises
-    :class:`ReferenceRowsMissing` otherwise.
+    :class:`ReferenceRowsMissing` (or its subclass) otherwise.
     """
     n_blocks = len(ref_blocks)
     rows_from_caller = int(sum(ref_row_counts))
     expected_cond = rows_from_caller + int(extra_condition_rows)
+
+    if forbid_references:
+        if declared_streams > 0:
+            raise ReferenceRowsForbidden(
+                f"reference conditioning is FORBIDDEN in this mode but the "
+                f"dataset declares {declared_streams} reference stream(s) "
+                "(reference_path). A declared stream is a channel the "
+                "experiment design rules out - remove it from the config; do "
+                "not relax this check."
+            )
+        if n_blocks > 0 or rows_from_caller > 0:
+            raise ReferenceRowsForbidden(
+                f"reference conditioning is FORBIDDEN in this mode but the "
+                f"packed sequence carries {n_blocks} reference block(s) / "
+                f"{rows_from_caller} reference row(s). A stray reference "
+                "reintroduces the copyable channel (R6c/U7); training now "
+                "would measure a different experiment than the one frozen."
+            )
 
     if declared_streams > 0:
         if n_blocks == 0:
@@ -548,7 +589,8 @@ def assert_reference_rows(
         f"REF_ASSERT_OK declared_streams={declared_streams} blocks={n_blocks} "
         f"packed_reference_rows={rows_from_caller} "
         f"condition_rows={int(num_condition_video_rows)} "
-        f"dropout_configured={bool(dropout_configured)}"
+        f"dropout_configured={bool(dropout_configured)} "
+        f"forbid_references={bool(forbid_references)}"
     )
 
 

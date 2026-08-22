@@ -1358,6 +1358,13 @@ class MinimaxH3Model(BaseModel):
         declared = getattr(dcfg, "reference_path", None) if dcfg is not None else None
         if isinstance(declared, str):
             declared = [declared]
+        # R6c-E (amendment_r6ce A-2): `model_kwargs.require_zero_references`
+        # INVERTS the polarity - zero packed reference rows is correct and a
+        # nonzero count (or a declared stream) aborts. The mode is read from
+        # the model config, never inferred from the batch: a batch that
+        # happens to carry no references is not a declaration of intent.
+        forbid = bool(self.model_config.model_kwargs.get(
+            "require_zero_references", False))
         summary = assert_reference_rows(
             declared_streams=len(declared) if declared else 0,
             ref_blocks=tuple(ref_blocks),
@@ -1367,6 +1374,7 @@ class MinimaxH3Model(BaseModel):
                 int(cond_rows.shape[1]) if cond_rows is not None else 0
             ),
             dropout_configured=self._reference_dropout_configured(dcfg),
+            forbid_references=forbid,
         )
         if not MinimaxH3Model._ref_assert_reported:
             MinimaxH3Model._ref_assert_reported = True
