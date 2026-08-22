@@ -61,6 +61,13 @@ POSE_DIM = 12  # 3x4 camera-to-world, row-major — ReCamMaster's layout
 # usable camera signal anyway, so rejecting it is correct on its own terms.
 MIN_PLAUSIBLE_TRANSLATION_M = 0.1
 MAX_PLAUSIBLE_TRANSLATION_M = 1000.0
+# A STATIC camera (13.6% of the manifest; 3 of R6c-E's 36 commands, one of
+# them trained) anchored to its own frame 0 has a translation span of ~1e-15
+# m: float noise, not motion, and NOT the centimetre signature (a 0.62 m path
+# double-converted is 0.0062 m, four orders of magnitude above this). Found
+# at E3 (2026-08-22) on the real sidecars; G3's encoder arm only ever saw
+# arcs, so the check below had never met a static trajectory.
+STATIC_TRANSLATION_M = 1e-6
 
 
 def pose_vectors_from_c2w(c2w: torch.Tensor, check_scale: bool = True) -> torch.Tensor:
@@ -78,8 +85,8 @@ def pose_vectors_from_c2w(c2w: torch.Tensor, check_scale: bool = True) -> torch.
         raise ValueError(f"expected (F, 4, 4) camera-to-world, got {tuple(c2w.shape)}")
     if check_scale:
         span = float(c2w[:, :3, 3].max() - c2w[:, :3, 3].min())
-        if span > 0 and not (MIN_PLAUSIBLE_TRANSLATION_M <= span
-                             <= MAX_PLAUSIBLE_TRANSLATION_M):
+        if span > STATIC_TRANSLATION_M and not (MIN_PLAUSIBLE_TRANSLATION_M <= span
+                                                <= MAX_PLAUSIBLE_TRANSLATION_M):
             raise ValueError(
                 f"translation span {span:g} is not metres — a span this small "
                 "usually means centimetres were converted twice (ReCamMaster's "

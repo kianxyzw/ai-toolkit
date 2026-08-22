@@ -448,6 +448,22 @@ def test_pose_vectors_layout_matches_recammaster():
     assert torch.equal(v[0], torch.tensor([1., 0, 0, 1., 0, 1., 0, 2., 0, 0, 1., 3.]))
 
 
+def test_a_static_trajectory_with_float_noise_is_accepted():
+    """E3 (2026-08-22): a static camera anchored to its own frame 0 carries a
+    ~1e-15 m translation span - float noise. The scale check must not read
+    it as a double centimetre conversion (which would be ~0.006 m, four
+    orders of magnitude larger); a static command is a legitimate command
+    (13.6% of the manifest, 3 of R6c-E's 36)."""
+    from extensions_built_in.diffusion_models.minimax_h3.src.camera_encoder import (
+        poses_to_latent_vectors)
+    c2w = torch.eye(4).repeat(73, 1, 1)
+    c2w[:, :3, 3] = torch.tensor([1.5e-15, -2.0e-16, 0.0])
+    v = poses_to_latent_vectors(c2w, 22)
+    assert v.shape == (22, POSE_DIM)
+    c2w[:, :3, 3] = 0.0
+    poses_to_latent_vectors(c2w, 22)
+
+
 def test_double_centimetre_conversion_is_rejected():
     """ReCamMaster divides translations by 100; extrinsics.py already did.
     Re-applying leaves ~1 cm of motion — trains fine, conditions on nothing,
