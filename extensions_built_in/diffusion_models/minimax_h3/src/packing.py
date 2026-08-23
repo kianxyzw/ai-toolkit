@@ -490,6 +490,30 @@ class ReferenceRowsForbidden(ReferenceRowsMissing):
     """
 
 
+class ReferenceRowsWrongCount(ReferenceRowsMissing):
+    """The packed sequence carries the wrong NUMBER (or kind) of references.
+
+    R6c-EA (`amendment_r6ce_anchored` AA-2, 2026-08-23): the anchored regime
+    re-inverts A-2 a second time. Exactly ONE image-kind reference block is
+    correct -- the scene anchor -- and both neighbours are a known defect
+    returning:
+
+      0 blocks   the A-1 defect: no anchor, i.e. the R6c-E circuit whose
+                 reconstruction failed upstream of the command channel
+                 (E8, NO-SCENE-ANCHOR)
+      2+ blocks  the R6c / R6-T defect: a second stream is a copyable or
+                 command-bearing channel (U7, REFERENCE-COPY)
+
+    A VIDEO reference where an image was required is the same defect wearing a
+    different hat: a 73-frame reference gives the preservation prior motion to
+    copy frame for frame, which is exactly what AA-1 (iv) removes so that the
+    encoder is the only trajectory source in the circuit.
+
+    Subclasses :class:`ReferenceRowsMissing` so existing abort sites catch it;
+    the class name is what the log and the judging session read.
+    """
+
+
 def assert_reference_rows(
     declared_streams: int,
     ref_blocks: Tuple[dict, ...],
@@ -498,6 +522,8 @@ def assert_reference_rows(
     extra_condition_rows: int = 0,
     dropout_configured: bool = False,
     forbid_references: bool = False,
+    require_reference_streams: Optional[int] = None,
+    require_reference_kind: Optional[str] = None,
 ) -> str:
     """Positively measure that reference conditioning reached the pack — or,
     in a mode that forbids references, positively measure that NONE did.
@@ -525,7 +551,16 @@ def assert_reference_rows(
     ``forbid_references`` is the MODE-AWARE inversion (R6c-E, A-2): when
     set, a declared stream, a packed reference block, or a nonzero reference
     row count is the defect, and :class:`ReferenceRowsForbidden` is raised.
-    Both polarities are tested against wrong-mode batches in
+
+    ``require_reference_streams`` is the EXACT-COUNT branch (R6c-EA, AA-2):
+    the pack must carry precisely that many reference blocks -- fewer is the
+    A-1 defect returning (no anchor), more is the R6c/R6-T defect returning (a
+    second, copyable stream) -- and ``require_reference_kind`` pins what they
+    must be ("image" for the anchor). It is mutually exclusive with
+    ``forbid_references``: a mode cannot both require and forbid a reference,
+    and a config that says both is a config nobody has read.
+
+    All three polarities are tested against wrong-mode batches in
     ``testing/test_h3_reference_assert.py``.
 
     Returns a one-line greppable summary for the training log; raises
@@ -534,6 +569,45 @@ def assert_reference_rows(
     n_blocks = len(ref_blocks)
     rows_from_caller = int(sum(ref_row_counts))
     expected_cond = rows_from_caller + int(extra_condition_rows)
+
+    if forbid_references and require_reference_streams is not None:
+        raise ValueError(
+            "require_zero_references and require_reference_streams are both "
+            f"set (={require_reference_streams}). A mode cannot forbid and "
+            "require the same channel; fix the model config rather than "
+            "picking one here."
+        )
+
+    if require_reference_streams is not None:
+        want = int(require_reference_streams)
+        if n_blocks != want:
+            which = ("the A-1 defect returning (no anchor: the R6c-E circuit)"
+                     if n_blocks < want else
+                     "the R6c/R6-T defect returning (a second stream is a "
+                     "copyable or command-bearing channel)")
+            raise ReferenceRowsWrongCount(
+                f"this mode requires EXACTLY {want} packed reference block(s) "
+                f"and the sequence carries {n_blocks} ({rows_from_caller} "
+                f"reference row(s)) - {which}. Fix the dataset/config; do not "
+                "relax this check."
+            )
+        if declared_streams != want:
+            raise ReferenceRowsWrongCount(
+                f"this mode requires EXACTLY {want} reference stream(s) and "
+                f"the dataset declares {declared_streams} (reference_path). "
+                "The declaration and the pack must agree, or the run measures "
+                "a different experiment than the one frozen."
+            )
+        if require_reference_kind is not None:
+            kinds = [b.get("kind") for b in ref_blocks]
+            if any(k != require_reference_kind for k in kinds):
+                raise ReferenceRowsWrongCount(
+                    f"this mode requires {require_reference_kind!r}-kind "
+                    f"reference block(s) and the pack carries {kinds}. A video "
+                    "reference gives the preservation prior motion to copy "
+                    "frame for frame - the one thing the anchor exists to "
+                    "avoid carrying."
+                )
 
     if forbid_references:
         if declared_streams > 0:
@@ -590,7 +664,9 @@ def assert_reference_rows(
         f"packed_reference_rows={rows_from_caller} "
         f"condition_rows={int(num_condition_video_rows)} "
         f"dropout_configured={bool(dropout_configured)} "
-        f"forbid_references={bool(forbid_references)}"
+        f"forbid_references={bool(forbid_references)} "
+        f"require_reference_streams={require_reference_streams} "
+        f"reference_kinds={[b.get('kind') for b in ref_blocks]}"
     )
 
 

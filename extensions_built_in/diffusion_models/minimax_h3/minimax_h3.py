@@ -1365,6 +1365,14 @@ class MinimaxH3Model(BaseModel):
         # happens to carry no references is not a declaration of intent.
         forbid = bool(self.model_config.model_kwargs.get(
             "require_zero_references", False))
+        # R6c-EA (amendment_r6ce_anchored AA-2): the EXACT-COUNT branch. Read
+        # from the model config for the same reason `forbid` is (the E2 rule):
+        # a batch that happens to carry one reference is not a declaration
+        # that exactly one was intended.
+        require_n = self.model_config.model_kwargs.get(
+            "require_reference_streams", None)
+        require_kind = self.model_config.model_kwargs.get(
+            "require_reference_kind", None)
         summary = assert_reference_rows(
             declared_streams=len(declared) if declared else 0,
             ref_blocks=tuple(ref_blocks),
@@ -1375,6 +1383,8 @@ class MinimaxH3Model(BaseModel):
             ),
             dropout_configured=self._reference_dropout_configured(dcfg),
             forbid_references=forbid,
+            require_reference_streams=(None if require_n is None else int(require_n)),
+            require_reference_kind=require_kind,
         )
         if not MinimaxH3Model._ref_assert_reported:
             MinimaxH3Model._ref_assert_reported = True

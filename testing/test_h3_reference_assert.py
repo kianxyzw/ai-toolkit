@@ -9,7 +9,8 @@ path, so presence has to be measured, not inferred.
 Two halves, both tested here:
 
   - the pure geometry check (``src.packing.assert_reference_rows``): presence,
-    non-emptiness, alignment, and the R5c dropout relaxation
+    non-emptiness, alignment, the R5c dropout relaxation, the R6c-E forbid
+    inversion, and the R6c-EA EXACT-COUNT branch (AA-2)
   - the call site inside ``get_noise_prediction``: a real CPU forward through a
     tiny transformer, with references and without, so the abort is proven by
     behaviour rather than by reading the source
@@ -33,6 +34,7 @@ from extensions_built_in.diffusion_models.minimax_h3.minimax_h3 import MinimaxH3
 from extensions_built_in.diffusion_models.minimax_h3.src.packing import (
     ReferenceRowsForbidden,
     ReferenceRowsMissing,
+    ReferenceRowsWrongCount,
     assert_reference_rows,
     audio_latent_num_frames,
 )
@@ -46,6 +48,7 @@ from toolkit.config_modules import ModelConfig
 FAILURES = []
 
 VIDEO_BLOCK = {"kind": "video", "latent_t": 2, "latent_h": 8, "latent_w": 10}
+IMAGE_BLOCK = {"kind": "image", "latent_h": 48, "latent_w": 48}
 
 
 def check(name, ok, detail=""):
@@ -204,6 +207,144 @@ def test_pure_inverted():
         ref_row_counts=[40, 40], num_condition_video_rows=80)
     check("default polarity unchanged (forbid_references=False in the summary)",
           "forbid_references=False" in summary, summary)
+
+
+# ---------------------------------------------------------------------------
+# 1c. the EXACT-COUNT polarity (R6c-EA, amendment_r6ce_anchored AA-2, 2026-08-23)
+# ---------------------------------------------------------------------------
+
+
+def test_pure_exact_count():
+    """A-2 re-inverted a second time: exactly ONE image-kind reference block.
+
+    Zero is the A-1 defect returning (no anchor - the R6c-E circuit E8 judged
+    NO-SCENE-ANCHOR); two or more is the R6c/R6-T defect returning (a second
+    stream is copyable or command-bearing).
+    """
+    print("\npure check, require_reference_streams=1 (R6c-EA AA-2)")
+
+    summary = assert_reference_rows(
+        declared_streams=1, ref_blocks=(IMAGE_BLOCK,), ref_row_counts=[576],
+        num_condition_video_rows=576, require_reference_streams=1,
+        require_reference_kind="image")
+    check("the anchored shape (one image block) passes",
+          "REF_ASSERT_OK" in summary, summary)
+    check("summary carries the armed count and the kinds",
+          "require_reference_streams=1" in summary
+          and "reference_kinds=['image']" in summary, summary)
+    check("the anchor's 576 rows are reported",
+          "packed_reference_rows=576" in summary, summary)
+
+    # ⚠ WRONG-MODE COPY: the R6c-E batch (nothing declared, nothing packed)
+    raises("WRONG-MODE COPY: the R6c-E batch under the R6c-EA assertion aborts",
+           lambda: assert_reference_rows(
+               declared_streams=0, ref_blocks=(), ref_row_counts=[],
+               num_condition_video_rows=0, require_reference_streams=1),
+           "A-1 defect returning", cls=ReferenceRowsWrongCount)
+
+    # ⚠ WRONG-MODE COPY: a second stream - the R6c/R6-T shape
+    raises("WRONG-MODE COPY: two packed references under R6c-EA abort",
+           lambda: assert_reference_rows(
+               declared_streams=2, ref_blocks=(IMAGE_BLOCK, VIDEO_BLOCK),
+               ref_row_counts=[576, 40], num_condition_video_rows=616,
+               require_reference_streams=1),
+           "R6c/R6-T defect returning", cls=ReferenceRowsWrongCount)
+
+    # a VIDEO reference where the anchor was required: motion for the
+    # preservation prior to copy, which AA-1 (iv) exists to remove
+    raises("a video reference where an image was required aborts",
+           lambda: assert_reference_rows(
+               declared_streams=1, ref_blocks=(VIDEO_BLOCK,), ref_row_counts=[40],
+               num_condition_video_rows=40, require_reference_streams=1,
+               require_reference_kind="image"),
+           "copy\nframe for frame".replace("\n", " "), cls=ReferenceRowsWrongCount)
+
+    # the declaration and the pack must AGREE, both directions
+    raises("declared 2 but exactly 1 required aborts on the declaration",
+           lambda: assert_reference_rows(
+               declared_streams=2, ref_blocks=(IMAGE_BLOCK,), ref_row_counts=[576],
+               num_condition_video_rows=576, dropout_configured=True,
+               require_reference_streams=1),
+           "the dataset declares 2", cls=ReferenceRowsWrongCount)
+
+    # a mode cannot both forbid and require the same channel
+    try:
+        assert_reference_rows(
+            declared_streams=1, ref_blocks=(IMAGE_BLOCK,), ref_row_counts=[576],
+            num_condition_video_rows=576, forbid_references=True,
+            require_reference_streams=1)
+        check("forbid + require is a config error", False, "no ValueError")
+    except ValueError as e:
+        check("forbid + require is a config error", "both" in str(e), str(e))
+    except Exception as e:  # noqa: BLE001
+        check("forbid + require is a config error", False, repr(e))
+
+    # and the default polarity is untouched: the branch is opt-in
+    summary = assert_reference_rows(
+        declared_streams=2, ref_blocks=(VIDEO_BLOCK, VIDEO_BLOCK),
+        ref_row_counts=[40, 40], num_condition_video_rows=80)
+    check("default polarity unchanged (require_reference_streams=None)",
+          "require_reference_streams=None" in summary, summary)
+
+
+def test_forward_exact_count():
+    """The call site under model_kwargs.require_reference_streams (R6c-EA)."""
+    print("\ncall site, require_reference_streams=1 (real CPU forward)")
+    torch.manual_seed(0)
+    num_frames = 5
+    latent = torch.randn(1, 24, 2, 8, 10)
+    timestep = torch.tensor([500.0])
+    MinimaxH3Model._ref_assert_reported = False
+
+    model = make_model("ref2va", {"require_reference_streams": 1,
+                                  "require_reference_kind": "image"})
+    embeds = make_embeds()
+    # an IMAGE reference is one latent frame on its own canvas
+    anchor = [torch.randn(1, 24, 1, 8, 10)]
+    two = [torch.randn(1, 24, 1, 8, 10), torch.randn(1, 24, 2, 6, 8)]
+
+    batch = make_batch(num_frames, refs=anchor, kinds=["image"],
+                       reference_path=["/data/reference"])
+    pred = model.get_noise_prediction(latent, timestep, embeds, batch=batch)
+    check("R6c-EA batch (one image anchor) trains under the exact-count assertion",
+          bool(torch.isfinite(pred).all()))
+
+    # ⚠ WRONG-MODE COPY: the R6c-E batch (no anchor) under the R6c-EA call site
+    batch = make_batch(num_frames, refs=None, kinds=None, reference_path=None)
+    raises("R6c-E batch under the R6c-EA call site ABORTS",
+           lambda: model.get_noise_prediction(
+               latent, timestep, embeds, batch=batch),
+           "A-1 defect returning", cls=ReferenceRowsWrongCount)
+
+    # ⚠ WRONG-MODE COPY: a second stream under the R6c-EA call site
+    batch = make_batch(num_frames, refs=two, kinds=["image", "video"],
+                       reference_path=["/data/reference", "/data/raymap_ref"])
+    raises("two references under the R6c-EA call site ABORT",
+           lambda: model.get_noise_prediction(
+               latent, timestep, embeds, batch=batch),
+           "R6c/R6-T defect returning", cls=ReferenceRowsWrongCount)
+
+    # ⚠ a video reference where the anchor was required
+    batch = make_batch(num_frames, refs=[torch.randn(1, 24, 2, 8, 10)],
+                       kinds=["video"], reference_path=["/data/reference"])
+    raises("a video reference under the R6c-EA call site ABORTS",
+           lambda: model.get_noise_prediction(
+               latent, timestep, embeds, batch=batch),
+           "video reference", cls=ReferenceRowsWrongCount)
+
+    # ⚠ the mirror wrong-mode copy: the R6c-EA batch under the R6c-E model
+    r6ce_model = make_model("ref2va", {"require_zero_references": True})
+    batch = make_batch(num_frames, refs=anchor, kinds=["image"],
+                       reference_path=["/data/reference"])
+    raises("R6c-EA batch under the R6c-E call site ABORTS",
+           lambda: r6ce_model.get_noise_prediction(
+               latent, timestep, embeds, batch=batch),
+           "FORBIDDEN", cls=ReferenceRowsForbidden)
+
+    # sampling still skips: the pipeline supplies its own references
+    pred = model.get_noise_prediction(latent, timestep, embeds, batch=None)
+    check("batch=None (sampling) skips the exact-count check too",
+          bool(torch.isfinite(pred).all()))
 
 
 def make_model(partition="ref2va", model_kwargs=None):
@@ -381,8 +522,10 @@ def test_forward_inverted():
 def main():
     test_pure()
     test_pure_inverted()
+    test_pure_exact_count()
     test_forward()
     test_forward_inverted()
+    test_forward_exact_count()
     print()
     if FAILURES:
         print(f"TEST FAIL - {len(FAILURES)} failure(s): {FAILURES}")
