@@ -480,6 +480,176 @@ def test_double_centimetre_conversion_is_rejected():
     raise AssertionError("accepted double-converted centimetres")
 
 
+# ---------------------------------------------------------------------------
+# 5. E12b — the output GAIN knob (one multiplicative scale, config-plumbed)
+#
+# The knob exists because R6c-EA's trained channel moves the output in 2 of 4
+# sources and sits at or under the generator's noise floor in the other two
+# (E12, 2026-08-24). Scaling the SAME weights separates "weak but right" from
+# "command-uncorrelated noise". Everything below pins the three properties the
+# sweep's reading depends on; break any one and the sweep measures something
+# else.
+# ---------------------------------------------------------------------------
+
+def test_gain_one_is_an_exact_no_op_against_the_ungained_module():
+    """Default 1.0 must be BIT-identical, on TRAINED heads.
+
+    Not "close": the multiply is skipped rather than performed, so the op
+    sequence is the un-gained one. If this ever becomes an approximation, the
+    sweep's gain=1.0 arm stops being a re-run of the banked run.
+    """
+    p = pruned_params()
+    torch.manual_seed(7)
+    model = MiniMaxH3Transformer(p).eval()
+    enc = model.attach_camera_encoder(bottleneck=16)
+    for head in enc.heads:                       # a trained encoder, not zeros
+        torch.nn.init.normal_(head.weight, std=0.05)
+        torch.nn.init.normal_(head.bias, std=0.05)
+    batch, target_idx, n_frames = make_batch(p)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+
+    assert enc.gain == 1.0, "the default gain is not 1.0"
+    with torch.no_grad():
+        a_v, a_a = model(**batch, cam_pose=pose, target_video_indices=target_idx)
+        # the same module with the knob explicitly set to its default
+        enc.set_gain(1.0)
+        b_v, b_a = model(**batch, cam_pose=pose, target_video_indices=target_idx)
+    assert torch.equal(a_v, b_v) and torch.equal(a_a, b_a)
+
+    feats = enc.trunk_features(pose)
+    d1 = enc.block_delta(0, feats, 4)
+    plain = enc.heads[0](feats).repeat_interleave(4, dim=1)
+    assert torch.equal(d1, plain), "gain=1.0 changed the injected tensor"
+
+
+def test_gain_zero_kills_the_channel_exactly_like_zero_init():
+    """0.0 must reproduce the untrained base bit-for-bit, whatever the heads
+    hold — the control arm, and the property that makes the knob safe to hand
+    a distilled base."""
+    p = pruned_params()
+    torch.manual_seed(8)
+    model = MiniMaxH3Transformer(p).eval()
+    batch, target_idx, n_frames = make_batch(p)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+    with torch.no_grad():
+        no_encoder_v, no_encoder_a = model(**batch)
+
+    enc = model.attach_camera_encoder(bottleneck=16)
+    for head in enc.heads:
+        torch.nn.init.normal_(head.weight, std=0.5)
+        torch.nn.init.normal_(head.bias, std=0.5)
+    with torch.no_grad():
+        live_v, _ = model(**batch, cam_pose=pose, target_video_indices=target_idx)
+        enc.set_gain(0.0)
+        dead_v, dead_a = model(**batch, cam_pose=pose,
+                               target_video_indices=target_idx)
+    assert not torch.equal(live_v, no_encoder_v), \
+        "control: trained heads do move the output"
+    assert torch.equal(dead_v, no_encoder_v), "gain=0.0 did not kill the channel"
+    assert torch.equal(dead_a, no_encoder_a)
+    assert not enc.is_zero_initialized(), \
+        "control: the WEIGHTS are still trained — only the gain is zero"
+
+
+def test_gain_scales_the_injected_tensor_exactly_at_powers_of_two():
+    """The sweep's {1, 2, 4, 8} are powers of two, so the scaling is exact in
+    floating point and this is an equality, not a tolerance. A gain that only
+    approximately scaled would blur the very trend the read is registered on.
+    """
+    p = pruned_params()
+    torch.manual_seed(9)
+    model = MiniMaxH3Transformer(p).eval()
+    enc = model.attach_camera_encoder(bottleneck=16)
+    for head in enc.heads:
+        torch.nn.init.normal_(head.weight, std=0.05)
+        torch.nn.init.normal_(head.bias, std=0.05)
+    _, _, n_frames = make_batch(p)
+    feats = enc.trunk_features(torch.randn(1, n_frames, POSE_DIM))
+    layer = p.num_layers - 1          # the LAST block, not a guessed index
+    base = enc.block_delta(layer, feats, 4)
+    for g in (2.0, 4.0, 8.0):
+        enc.set_gain(g)
+        assert torch.equal(enc.block_delta(layer, feats, 4), base * g), f"gain {g}"
+
+
+def test_gain_scales_the_TARGET_ROWS_ONLY_at_the_write_site():
+    """Scaling must not reach a row the un-gained module does not write.
+
+    Asserted at the write site (the residual stream entering block 0), for the
+    same reason the R6b write test is: attention is global, so an end-to-end
+    check cannot tell "wrote elsewhere" from "propagated", and would fail on
+    correct code.
+    """
+    p = pruned_params()
+    torch.manual_seed(10)
+    model = MiniMaxH3Transformer(p).eval()
+    enc = model.attach_camera_encoder(bottleneck=16)
+    for head in enc.heads:
+        torch.nn.init.normal_(head.weight, std=0.5)
+    n_cond_frames, rows_per_frame = 2, 4
+    batch, target_idx, n_frames = make_batch(
+        p, num_cond_frames=n_cond_frames, rows_per_frame=rows_per_frame)
+    pose = torch.randn(1, n_frames, POSE_DIM)
+
+    seen = []
+    handle = model.blocks[0].register_forward_pre_hook(
+        lambda _m, args: seen.append(args[0].detach().clone()))
+    try:
+        with torch.no_grad():
+            enc.set_gain(1.0)
+            model(**batch, cam_pose=pose, target_video_indices=target_idx)
+            enc.set_gain(4.0)
+            model(**batch, cam_pose=pose, target_video_indices=target_idx)
+    finally:
+        handle.remove()
+
+    target = set(target_idx.tolist())
+    moved = set(((seen[1] - seen[0])[0].abs().sum(-1) > 0)
+                .nonzero().flatten().tolist())
+    assert moved == target, \
+        f"gain moved {sorted(moved - target)} outside the target rows"
+
+
+def test_gain_is_not_in_the_state_dict():
+    """A registered buffer would join ``state_dict`` — and the R6c-EA generator
+    loads the banked encoder with an exact key check that raises on any missing
+    key, so a gain buffer would make every banked checkpoint unloadable. The
+    knob is a run-time scale over frozen weights and stays out of the artifact.
+    """
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    enc = model.attach_camera_encoder(bottleneck=16, gain=4.0)
+    assert enc.gain == 4.0
+    keys = list(enc.state_dict().keys())
+    assert not any("gain" in k for k in keys), keys
+    fresh = MiniMaxH3CameraEncoder(p.hidden_size, p.num_layers, bottleneck=16)
+    missing, unexpected = fresh.load_state_dict(enc.state_dict(), strict=False)
+    assert not missing and not unexpected, (missing, unexpected)
+
+
+def test_a_nonsense_gain_is_refused_rather_than_silently_scaled():
+    """A negative gain INVERTS the command instead of scaling it — a different
+    experiment with a different reading. Refused here so it cannot arrive as a
+    result that looks like "amplification made it worse"."""
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    enc = model.attach_camera_encoder(bottleneck=16)
+    for bad in (-1.0, float("nan"), float("inf")):
+        try:
+            enc.set_gain(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted gain {bad}")
+    assert enc.gain == 1.0, "a refused gain must leave the knob where it was"
+
+
+def test_attach_and_the_module_default_agree_on_one_point_zero():
+    p = pruned_params()
+    model = MiniMaxH3Transformer(p)
+    assert model.attach_camera_encoder(bottleneck=16).gain == 1.0
+    assert MiniMaxH3CameraEncoder(64, 2, bottleneck=16).gain == 1.0
+
+
 if __name__ == "__main__":
     print("R6b camera encoder")
     for name, fn in sorted(globals().items()):

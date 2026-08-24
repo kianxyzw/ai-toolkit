@@ -412,8 +412,13 @@ class MiniMaxH3Transformer(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def attach_camera_encoder(self, bottleneck: int = 256):
+    def attach_camera_encoder(self, bottleneck: int = 256, gain: float = 1.0):
         """Attach the R6b camera encoder. Zero-init, so this is a no-op at step 0.
+
+        ``gain`` is the E12b output scale (default 1.0 = the un-gained op
+        sequence, exactly). It is a run-time knob over frozen weights and does
+        not enter the encoder's ``state_dict`` — see
+        ``camera_encoder.MiniMaxH3CameraEncoder.set_gain``.
 
         ⚠ The encoder's linears become children of this module, which means
         ai-toolkit's LoRA targeting would sweep them up: it selects by module
@@ -430,6 +435,7 @@ class MiniMaxH3Transformer(nn.Module):
             hidden_size=self.params.hidden_size,
             num_layers=self.params.num_layers,
             bottleneck=bottleneck,
+            gain=gain,
         )
         return self.camera_encoder
 

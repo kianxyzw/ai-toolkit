@@ -150,15 +150,19 @@ class MiniMaxH3CameraEncoder(nn.Module):
     ReCamMaster zero-inits the encoder and identity-inits its projector; the
     composition is a no-op either way, and zero-init on the *output* is the
     formulation that stays a no-op if the trunk is ever pre-trained.
+
+    ``gain`` (default 1.0, an exact no-op) scales the injected term at that
+    same output. See :meth:`set_gain`.
     """
 
     def __init__(self, hidden_size: int, num_layers: int, bottleneck: int = 256,
-                 pose_dim: int = POSE_DIM):
+                 pose_dim: int = POSE_DIM, gain: float = 1.0):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.bottleneck = bottleneck
         self.pose_dim = pose_dim
+        self.set_gain(gain)
         self.trunk = nn.Sequential(
             nn.Linear(pose_dim, bottleneck),
             nn.SiLU(),
@@ -168,6 +172,53 @@ class MiniMaxH3CameraEncoder(nn.Module):
             [nn.Linear(bottleneck, hidden_size) for _ in range(num_layers)]
         )
         self.zero_init()
+
+    def set_gain(self, gain: float) -> None:
+        """One multiplicative scale on this module's OUTPUT, nothing else.
+
+        The knob exists to ask a question the R6c-EA bank could not answer:
+        the trained channel moves the output in only 2 of 4 sources, and in the
+        other two it sits at or under the generator's own noise floor (E12,
+        2026-08-24). Either the channel carries a weak-but-right signal, or it
+        carries command-uncorrelated noise. Scaling the SAME trained weights is
+        the cheapest separation: a right-but-weak signal should move the output
+        toward the commanded view as it is amplified; noise should only
+        degrade.
+
+        Three properties, each of which a test pins:
+
+        - ``1.0`` is an **exact no-op**: :meth:`block_delta` skips the multiply
+          entirely, so the op sequence is the un-gained one. Bit-identity is
+          by construction, not by rounding.
+        - ``0.0`` **kills the channel** whatever the heads hold — the delta is
+          all zeros and ``index_add`` of zeros is bitwise identity, exactly the
+          zero-init behaviour the distilled base is protected by.
+        - any other value scales ONLY the injected rows, because that is the
+          only place the term is added. The sweep's {2, 4, 8} are powers of two,
+          so the scaling is exact in floating point and a test can assert
+          equality rather than a tolerance.
+
+        ⚠ **A plain attribute, deliberately NOT a buffer or parameter.** A
+        registered buffer would join ``state_dict``, and the R6c-EA generator
+        loads the banked encoder with an exact key check that raises on any
+        missing key — a gain buffer would make every banked checkpoint
+        unloadable. It is a run-time knob over frozen weights, and it stays out
+        of the artifact.
+
+        A negative gain would INVERT the command rather than scale it. That is
+        a different experiment with a different reading, so it is refused here
+        rather than silently producing a result that looks like "amplification
+        made it worse".
+        """
+        g = float(gain)
+        if g != g or g in (float("inf"), float("-inf")):
+            raise ValueError(f"camera-encoder gain must be finite, got {gain!r}")
+        if g < 0:
+            raise ValueError(
+                f"camera-encoder gain must be >= 0, got {g} — a negative gain "
+                "inverts the command instead of scaling it, which is a "
+                "different experiment and must be registered as one")
+        self.gain = g
 
     def zero_init(self):
         """Zero every per-block head. Idempotent; called from __init__."""
@@ -196,8 +247,16 @@ class MiniMaxH3CameraEncoder(nn.Module):
         target rows are ordered frame-major (all rows of frame 0, then frame
         1); tiling instead would pair every frame with the wrong rows and
         still produce a plausible-looking tensor of the right shape.
+
+        ``self.gain`` scales the whole injected term (see :meth:`set_gain`).
+        At the default 1.0 the multiply is SKIPPED rather than performed, so
+        this is the same sequence of operations the un-gained module ran — a
+        no-op by code path, not by floating-point luck.
         """
-        return self.heads[layer](features).repeat_interleave(rows_per_frame, dim=1)
+        delta = self.heads[layer](features)
+        if self.gain != 1.0:
+            delta = delta * self.gain
+        return delta.repeat_interleave(rows_per_frame, dim=1)
 
     def forward(self, pose: torch.Tensor, layer: int,
                 rows_per_frame: int) -> torch.Tensor:

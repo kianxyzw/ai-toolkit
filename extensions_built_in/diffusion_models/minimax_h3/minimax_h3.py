@@ -530,7 +530,15 @@ class MinimaxH3Model(BaseModel):
             bottleneck = int(
                 self.model_config.model_kwargs.get("camera_encoder_bottleneck", 256)
             )
-            enc = transformer.attach_camera_encoder(bottleneck=bottleneck)
+            # E12b: one multiplicative scale on the encoder's output, config
+            # -plumbed so a run states it rather than a script hardcoding it.
+            # 1.0 is an exact no-op (the multiply is skipped, not performed),
+            # which is what keeps every prior run's path unchanged.
+            gain = float(
+                self.model_config.model_kwargs.get("camera_encoder_gain", 1.0)
+            )
+            enc = transformer.attach_camera_encoder(bottleneck=bottleneck,
+                                                    gain=gain)
             # the transformer's own params were assigned from the checkpoint, so
             # the freshly-built encoder is still on CPU/float32
             enc.to(device=self.device_torch, dtype=dtype)
@@ -543,7 +551,7 @@ class MinimaxH3Model(BaseModel):
             n = sum(p.numel() for p in enc.parameters())
             self.print_and_status_update(
                 f" - attached camera encoder (bottleneck {bottleneck}, "
-                f"{n / 1e6:.1f}M params, zero-init)"
+                f"{n / 1e6:.1f}M params, zero-init, gain {enc.gain})"
             )
         return transformer
 
